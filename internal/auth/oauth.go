@@ -50,7 +50,7 @@ func NewProvider(clientID, clientSecret, redirectURI, frontendURL string, tokens
 	}
 }
 
-func (p *Provider) Begin(compat bool) (Login, error) {
+func (p *Provider) Begin(returnTo string) (Login, error) {
 	state, err := RandomBase64URL(32)
 	if err != nil {
 		return Login{}, err
@@ -59,7 +59,10 @@ func (p *Provider) Begin(compat bool) (Login, error) {
 	if err != nil {
 		return Login{}, err
 	}
-	stateToken, err := p.tokens.SignOAuthState(state, verifier, p.frontendURL, compat)
+	if strings.TrimSpace(returnTo) == "" {
+		returnTo = p.frontendURL
+	}
+	stateToken, err := p.tokens.SignOAuthState(state, verifier, returnTo)
 	if err != nil {
 		return Login{}, err
 	}

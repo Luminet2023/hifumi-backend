@@ -2,13 +2,10 @@ package realtime
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -145,35 +142,6 @@ func (c *Client) SubscribeHints(ctx context.Context, onHint func(Hint)) error {
 			}
 		}
 	}
-}
-
-func (c *Client) PutHandoff(ctx context.Context, token string, ttl time.Duration) (string, error) {
-	codeBytes := make([]byte, 32)
-	if _, err := rand.Read(codeBytes); err != nil {
-		return "", err
-	}
-	code := base64.RawURLEncoding.EncodeToString(codeBytes)
-	if err := c.redis.Set(ctx, c.prefix+"handoff:"+code, token, ttl).Err(); err != nil {
-		return "", err
-	}
-	return code, nil
-}
-
-var consumeScript = redis.NewScript(`
-local value = redis.call('GET', KEYS[1])
-if value then redis.call('DEL', KEYS[1]) end
-return value
-`)
-
-func (c *Client) ConsumeHandoff(ctx context.Context, code string) (string, error) {
-	if len(code) < 32 || len(code) > 128 || strings.ContainsAny(code, " /\\") {
-		return "", fmt.Errorf("invalid handoff code")
-	}
-	value, err := consumeScript.Run(ctx, c.redis, []string{c.prefix + "handoff:" + code}).Text()
-	if errors.Is(err, redis.Nil) {
-		return "", nil
-	}
-	return value, err
 }
 
 func (c *Client) DebugKey(operation, ownerKey string) string {

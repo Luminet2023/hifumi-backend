@@ -1,14 +1,15 @@
 package auth
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestSessionRoundTripAndLegacyIssuerBoundary(t *testing.T) {
-	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna", "https://stellafortuna.luminet.cn")
+func TestSessionRoundTripAndIssuerBoundary(t *testing.T) {
+	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,34 +22,31 @@ func TestSessionRoundTripAndLegacyIssuerBoundary(t *testing.T) {
 	if expires.Sub(now) != SessionLifetime {
 		t.Fatalf("unexpected session lifetime: %s", expires.Sub(now))
 	}
-	claims, err := manager.VerifySession(raw, false)
+	claims, err := manager.VerifySession(raw)
 	if err != nil || claims.Subject != "42" {
 		t.Fatalf("verify session: claims=%+v err=%v", claims, err)
 	}
 	manager.now = func() time.Time { return expires.Add(10 * time.Second) }
-	if _, err := manager.VerifySession(raw, false); err == nil {
+	if _, err := manager.VerifySession(raw); err == nil {
 		t.Fatal("expired session was accepted")
 	}
-}
-
-func TestLegacyJSGoldenTokenRequiresTrustedCompatibilityPath(t *testing.T) {
-	const legacyToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3N0ZWxsYWZvcnR1bmEubHVtaW5ldC5jbiIsImF1ZCI6InN0ZWxsYWZvcnR1bmEiLCJzdWIiOiJsZWdhY3ktdXNlciIsInVzZXJuYW1lIjoibGVnYWN5IiwiaWF0IjoxOTk5OTk5MDAwLCJuYmYiOjE5OTk5OTkwMDAsImV4cCI6MjAwMDAwMDAwMH0.AQI14TFM4ZwPY2c6f74y1qySbyxCoBAjDmwtzyVELHw"
-	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna", "https://stellafortuna.luminet.cn")
+	legacyManager, err := NewManager("0123456789abcdef0123456789abcdef", "https://stellafortuna.luminet.cn", "stellafortuna")
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.now = func() time.Time { return time.Unix(1_999_999_500, 0) }
-	if _, err := manager.VerifySession(legacyToken, false); err == nil {
-		t.Fatal("legacy issuer was accepted without trusted compatibility mode")
+	legacyManager.now = func() time.Time { return now }
+	legacyToken, _, err := legacyManager.SignSession(Profile{Subject: "legacy-user"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	claims, err := manager.VerifySession(legacyToken, true)
-	if err != nil || claims.Subject != "legacy-user" {
-		t.Fatalf("verify JS golden token: claims=%+v err=%v", claims, err)
+	manager.now = func() time.Time { return now }
+	if _, err := manager.VerifySession(legacyToken); err == nil {
+		t.Fatal("session with a legacy issuer was accepted")
 	}
 }
 
 func TestSessionRejectsTamperingAndNonHS256(t *testing.T) {
-	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna", "")
+	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +56,7 @@ func TestSessionRejectsTamperingAndNonHS256(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.VerifySession(raw+"tampered", false); err == nil {
+	if _, err := manager.VerifySession(raw + "tampered"); err == nil {
 		t.Fatal("tampered session was accepted")
 	}
 	claims := SessionClaims{RegisteredClaims: jwt.RegisteredClaims{
@@ -69,26 +67,43 @@ func TestSessionRejectsTamperingAndNonHS256(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.VerifySession(hs384, false); err == nil {
+	if _, err := manager.VerifySession(hs384); err == nil {
 		t.Fatal("non-HS256 session was accepted")
 	}
 }
 
 func TestOAuthPurposeAndState(t *testing.T) {
-	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna", "")
+	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna")
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := manager.SignOAuthState("state-1", "verifier-1", "https://stellafortuna.luminet.cn/", true)
+	raw, err := manager.SignOAuthState("state-1", "verifier-1", "https://stellafortuna.luminet.cn/")
 	if err != nil {
 		t.Fatal(err)
 	}
 	claims, err := manager.VerifyOAuthState(raw, "state-1")
-	if err != nil || !claims.Compat {
+	if err != nil || claims.ReturnTo != "https://stellafortuna.luminet.cn/" {
 		t.Fatalf("verify oauth state: claims=%+v err=%v", claims, err)
 	}
 	if _, err := manager.VerifyOAuthState(raw, "different"); err == nil {
 		t.Fatal("expected state mismatch")
+	}
+}
+
+func TestProviderBeginSignsSelectedReturnTo(t *testing.T) {
+	manager, err := NewManager("0123456789abcdef0123456789abcdef", "https://api.luminet.cn/hifumi", "stellafortuna")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := NewProvider("client", "secret", "https://api.luminet.cn/hifumi/v1/auth/callback",
+		"https://stellafortuna.luminet.cn/", manager, http.DefaultClient)
+	login, err := provider.Begin("https://stellafortuna.hifumi.luminet.cn/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := manager.VerifyOAuthState(login.StateToken, login.State)
+	if err != nil || claims.ReturnTo != "https://stellafortuna.hifumi.luminet.cn/" {
+		t.Fatalf("selected returnTo was not signed: claims=%+v err=%v", claims, err)
 	}
 }
 

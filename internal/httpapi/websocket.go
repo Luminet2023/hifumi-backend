@@ -26,8 +26,12 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUpgradeRequired, "websocket_upgrade_required")
 		return
 	}
-	if r.Header.Get("Origin") != s.cfg.FrontendOrigin {
+	if !s.isAllowedFrontendOrigin(r.Header.Get("Origin")) {
 		writeAPIError(w, http.StatusForbidden, "invalid_origin")
+		return
+	}
+	if !s.validRefererForOrigin(r, false) {
+		writeAPIError(w, http.StatusForbidden, "invalid_referer")
 		return
 	}
 	if !hasSubprotocol(r.Header.Get("Sec-WebSocket-Protocol"), SyncWebSocketProtocol) {

@@ -86,7 +86,7 @@ func serve() error {
 	if err := redisClient.Ping(startupContext); err != nil {
 		return fmt.Errorf("connect Redis: %w", err)
 	}
-	tokens, err := auth.NewManager(cfg.SessionSecret, cfg.PublicIssuer(), cfg.SessionAudience, cfg.LegacyIssuer)
+	tokens, err := auth.NewManager(cfg.SessionSecret, cfg.PublicIssuer(), cfg.SessionAudience)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func serve() error {
 		},
 	}
 	provider := auth.NewProvider(
-		cfg.LinuxDOClientID, cfg.LinuxDOSecret, cfg.PublicURL("api/v1/auth/callback"),
+		cfg.LinuxDOClientID, cfg.LinuxDOSecret, cfg.PublicURL("v1/auth/callback"),
 		cfg.FrontendReturnURL.String(), tokens, oauthHTTPClient,
 	)
 	store := mysqlstore.New(db)

@@ -7,7 +7,7 @@ x-api-build: &api-build
 x-api-environment: &api-environment
   HTTP_ADDR: ":8080"
   PUBLIC_BASE_URL: "https://api.luminet.cn/hifumi/"
-  FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:-https://stellafortuna.luminet.cn}"
+  FRONTEND_ORIGINS: "${FRONTEND_ORIGINS:-https://stellafortuna.hifumi.luminet.cn,https://stellafortuna.luminet.cn}"
   FRONTEND_RETURN_URL: "${FRONTEND_RETURN_URL:-https://stellafortuna.luminet.cn/}"
   MYSQL_DSN: "${MYSQL_USER:-study_list}:${MYSQL_PASSWORD:?set MYSQL_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-study_list}?charset=utf8mb4&parseTime=true&loc=UTC"
   REDIS_URL: "redis://redis:6379/0"
@@ -15,9 +15,7 @@ x-api-environment: &api-environment
   LINUXDO_CLIENT_ID: "${LINUXDO_CLIENT_ID:?set LINUXDO_CLIENT_ID}"
   LINUXDO_CLIENT_SECRET: "${LINUXDO_CLIENT_SECRET:?set LINUXDO_CLIENT_SECRET}"
   SESSION_JWT_SECRET: "${SESSION_JWT_SECRET:?set SESSION_JWT_SECRET}"
-  COMPAT_PROXY_SECRET: "${COMPAT_PROXY_SECRET:?set COMPAT_PROXY_SECRET}"
   SESSION_AUDIENCE: "stellafortuna"
-  LEGACY_SESSION_ISSUER: "https://stellafortuna.luminet.cn"
   TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-}"
   LOG_LEVEL: "${LOG_LEVEL:-debug}"
 

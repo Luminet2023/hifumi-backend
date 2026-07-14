@@ -31,20 +31,18 @@ type OAuthClaims struct {
 	Purpose  string `json:"purpose"`
 	State    string `json:"state"`
 	Verifier string `json:"verifier"`
-	Compat   bool   `json:"compat,omitempty"`
 	ReturnTo string `json:"returnTo,omitempty"`
 	jwt.RegisteredClaims
 }
 
 type Manager struct {
-	secret       []byte
-	issuer       string
-	audience     string
-	legacyIssuer string
-	now          func() time.Time
+	secret   []byte
+	issuer   string
+	audience string
+	now      func() time.Time
 }
 
-func NewManager(secret, issuer, audience, legacyIssuer string) (*Manager, error) {
+func NewManager(secret, issuer, audience string) (*Manager, error) {
 	if len(secret) < 32 {
 		return nil, fmt.Errorf("session signing secret must contain at least 32 characters")
 	}
@@ -52,11 +50,10 @@ func NewManager(secret, issuer, audience, legacyIssuer string) (*Manager, error)
 		return nil, fmt.Errorf("session issuer and audience are required")
 	}
 	return &Manager{
-		secret:       []byte(secret),
-		issuer:       issuer,
-		audience:     audience,
-		legacyIssuer: legacyIssuer,
-		now:          time.Now,
+		secret:   []byte(secret),
+		issuer:   issuer,
+		audience: audience,
+		now:      time.Now,
 	}, nil
 }
 
@@ -81,7 +78,7 @@ func (m *Manager) SignSession(profile Profile) (string, time.Time, error) {
 	return token, expires, err
 }
 
-func (m *Manager) VerifySession(raw string, allowLegacyIssuer bool) (*SessionClaims, error) {
+func (m *Manager) VerifySession(raw string) (*SessionClaims, error) {
 	claims := &SessionClaims{}
 	token, err := jwt.ParseWithClaims(raw, claims, func(token *jwt.Token) (any, error) {
 		if token.Method != jwt.SigningMethodHS256 {
@@ -98,23 +95,18 @@ func (m *Manager) VerifySession(raw string, allowLegacyIssuer bool) (*SessionCla
 	if err != nil || !token.Valid || claims.Subject == "" {
 		return nil, ErrInvalidToken
 	}
-	issuerOK := claims.Issuer == m.issuer
-	if allowLegacyIssuer && m.legacyIssuer != "" {
-		issuerOK = issuerOK || claims.Issuer == m.legacyIssuer
-	}
-	if !issuerOK {
+	if claims.Issuer != m.issuer {
 		return nil, ErrInvalidToken
 	}
 	return claims, nil
 }
 
-func (m *Manager) SignOAuthState(state, verifier, returnTo string, compat bool) (string, error) {
+func (m *Manager) SignOAuthState(state, verifier, returnTo string) (string, error) {
 	now := m.now().UTC()
 	claims := OAuthClaims{
 		Purpose:  "linuxdo-oauth",
 		State:    state,
 		Verifier: verifier,
-		Compat:   compat,
 		ReturnTo: returnTo,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    m.issuer,

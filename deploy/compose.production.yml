@@ -1,0 +1,36 @@
+name: hifumi-backend
+
+x-api-image: &api-image "${HIFUMI_IMAGE:?set HIFUMI_IMAGE to an immutable GHCR digest}"
+
+x-api-security: &api-security
+  image: *api-image
+  network_mode: host
+  env_file:
+    - .env
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  migrate:
+    <<: *api-security
+    command: ["migrate"]
+    restart: "no"
+
+  api:
+    <<: *api-security
+    command: ["serve"]
+    init: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    restart: unless-stopped

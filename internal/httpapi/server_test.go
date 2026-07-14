@@ -25,29 +25,47 @@ import (
 )
 
 type fakeTokens struct {
-	claims *auth.SessionClaims
+	claims      *auth.SessionClaims
+	oauthClaims *auth.OAuthClaims
+	signErr     error
 }
 
 func (f *fakeTokens) SignSession(auth.Profile) (string, time.Time, error) {
+	if f.signErr != nil {
+		return "", time.Time{}, f.signErr
+	}
 	return "signed.token", time.Now().Add(auth.SessionLifetime), nil
 }
-func (f *fakeTokens) VerifySession(string, bool) (*auth.SessionClaims, error) {
+func (f *fakeTokens) VerifySession(string) (*auth.SessionClaims, error) {
 	if f.claims == nil {
 		return nil, auth.ErrInvalidToken
 	}
 	return f.claims, nil
 }
 func (f *fakeTokens) VerifyOAuthState(string, string) (*auth.OAuthClaims, error) {
-	return nil, auth.ErrInvalidToken
+	if f.oauthClaims == nil {
+		return nil, auth.ErrInvalidToken
+	}
+	return f.oauthClaims, nil
 }
 
-type fakeOAuth struct{ compat bool }
+type fakeOAuth struct {
+	returnTo string
+	profile  *auth.Profile
+	panic    bool
+}
 
-func (f *fakeOAuth) Begin(compat bool) (auth.Login, error) {
-	f.compat = compat
+func (f *fakeOAuth) Begin(returnTo string) (auth.Login, error) {
+	if f.panic {
+		panic("sensitive panic detail")
+	}
+	f.returnTo = returnTo
 	return auth.Login{AuthorizationURL: "https://connect.linux.do/oauth2/authorize", StateToken: "state.jwt"}, nil
 }
-func (*fakeOAuth) Complete(context.Context, string, *auth.OAuthClaims) (auth.Profile, error) {
+func (f *fakeOAuth) Complete(context.Context, string, *auth.OAuthClaims) (auth.Profile, error) {
+	if f.profile != nil {
+		return *f.profile, nil
+	}
 	return auth.Profile{}, errors.New("not implemented")
 }
 
@@ -68,9 +86,7 @@ func (*fakeSync) ResolveBaseline(context.Context, syncservice.CommandMetadata, *
 	return &syncservice.ResolveResult{Response: &syncv1.ResolveBaselineResponse{}}, nil
 }
 
-type fakeRealtime struct {
-	handoff string
-}
+type fakeRealtime struct{}
 
 func (*fakeRealtime) Ping(context.Context) error { return nil }
 func (*fakeRealtime) CheckFixedWindow(context.Context, string, string, int, time.Duration) (time.Duration, error) {
@@ -83,25 +99,24 @@ func (*fakeRealtime) RefreshConnection(context.Context, string, string, time.Dur
 	return true, nil
 }
 func (*fakeRealtime) ReleaseConnection(context.Context, string, string) error { return nil }
-func (*fakeRealtime) PutHandoff(context.Context, string, time.Duration) (string, error) {
-	return "handoff_0123456789abcdef", nil
-}
-func (f *fakeRealtime) ConsumeHandoff(context.Context, string) (string, error) {
-	return f.handoff, nil
-}
 
 func testServer(t *testing.T, tokens *fakeTokens, oauth *fakeOAuth, redis *fakeRealtime) *Server {
+	return testServerWithLogger(t, tokens, oauth, redis, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func testServerWithLogger(t *testing.T, tokens *fakeTokens, oauth *fakeOAuth, redis *fakeRealtime, logger *slog.Logger) *Server {
 	t.Helper()
 	publicBase, _ := url.Parse("https://api.luminet.cn/hifumi/")
 	frontendReturn, _ := url.Parse("https://stellafortuna.luminet.cn/")
 	server, err := NewServer(Dependencies{
 		Config: config.Config{
-			PublicBaseURL: publicBase, FrontendOrigin: "https://stellafortuna.luminet.cn",
-			FrontendReturnURL: frontendReturn, CompatProxySecret: strings.Repeat("c", 32),
+			PublicBaseURL:     publicBase,
+			FrontendOrigins:   []string{"https://stellafortuna.hifumi.luminet.cn", "https://stellafortuna.luminet.cn"},
+			FrontendReturnURL: frontendReturn,
 		},
 		Tokens: tokens, OAuth: oauth, Profiles: &fakeProfiles{}, Sync: &fakeSync{},
 		Realtime: redis, Hub: realtime.NewHub(),
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger: logger,
 		Build:  BuildInfo{Version: "test", Commit: "abc", BuildTime: "now"},
 	})
 	if err != nil {
@@ -112,8 +127,9 @@ func testServer(t *testing.T, tokens *fakeTokens, oauth *fakeOAuth, redis *fakeR
 
 func TestSessionUnauthenticatedAndCORS(t *testing.T) {
 	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
-	request := httptest.NewRequest(http.MethodGet, "/hifumi/api/v1/auth/session", nil)
+	request := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
 	request.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	request.Header.Set("Referer", "https://stellafortuna.luminet.cn/")
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"authenticated":false`) {
@@ -125,18 +141,49 @@ func TestSessionUnauthenticatedAndCORS(t *testing.T) {
 	if response.Header().Get("Access-Control-Allow-Credentials") != "true" || response.Header().Get("Vary") != "Origin" {
 		t.Fatal("credentialed CORS headers are incomplete")
 	}
-	malicious := httptest.NewRequest(http.MethodGet, "/hifumi/api/v1/auth/session", nil)
+	secondary := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
+	secondary.Header.Set("Origin", "https://stellafortuna.hifumi.luminet.cn")
+	secondary.Header.Set("Referer", "https://stellafortuna.hifumi.luminet.cn/day/2026-07-13")
+	secondaryResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(secondaryResponse, secondary)
+	if secondaryResponse.Code != http.StatusOK || secondaryResponse.Header().Get("Access-Control-Allow-Origin") != "https://stellafortuna.hifumi.luminet.cn" {
+		t.Fatalf("secondary frontend origin was rejected: %d %v", secondaryResponse.Code, secondaryResponse.Header())
+	}
+	malicious := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
 	malicious.Header.Set("Origin", "https://evil.example")
 	maliciousResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(maliciousResponse, malicious)
 	if maliciousResponse.Code != http.StatusForbidden {
 		t.Fatalf("malicious CORS origin returned %d", maliciousResponse.Code)
 	}
+	badReferer := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
+	badReferer.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	badReferer.Header.Set("Referer", "https://evil.example/embedded")
+	badRefererResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(badRefererResponse, badReferer)
+	if badRefererResponse.Code != http.StatusForbidden || !strings.Contains(badRefererResponse.Body.String(), "invalid_referer") {
+		t.Fatalf("malicious Referer returned %d %s", badRefererResponse.Code, badRefererResponse.Body.String())
+	}
+	missingReferer := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
+	missingReferer.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	missingRefererResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(missingRefererResponse, missingReferer)
+	if missingRefererResponse.Code != http.StatusForbidden || !strings.Contains(missingRefererResponse.Body.String(), "invalid_referer") {
+		t.Fatalf("missing Referer returned %d %s", missingRefererResponse.Code, missingRefererResponse.Body.String())
+	}
+	mismatchedReferer := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/session", nil)
+	mismatchedReferer.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	mismatchedReferer.Header.Set("Referer", "https://stellafortuna.hifumi.luminet.cn/")
+	mismatchedRefererResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(mismatchedRefererResponse, mismatchedReferer)
+	if mismatchedRefererResponse.Code != http.StatusForbidden || !strings.Contains(mismatchedRefererResponse.Body.String(), "invalid_referer") {
+		t.Fatalf("cross-allowlist Referer returned %d %s", mismatchedRefererResponse.Code, mismatchedRefererResponse.Body.String())
+	}
 }
 
 func TestStateChangingOriginAndCookiePath(t *testing.T) {
 	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
-	bad := httptest.NewRequest(http.MethodPost, "/hifumi/api/v1/auth/logout", nil)
+	bad := httptest.NewRequest(http.MethodPost, "/hifumi/v1/auth/logout", nil)
 	bad.Header.Set("Origin", "https://evil.example")
 	badResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(badResponse, bad)
@@ -144,8 +191,9 @@ func TestStateChangingOriginAndCookiePath(t *testing.T) {
 		t.Fatalf("unexpected bad-origin status %d", badResponse.Code)
 	}
 
-	good := httptest.NewRequest(http.MethodPost, "/hifumi/api/v1/auth/logout", nil)
+	good := httptest.NewRequest(http.MethodPost, "/hifumi/v1/auth/logout", nil)
 	good.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	good.Header.Set("Referer", "https://stellafortuna.luminet.cn/settings")
 	goodResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(goodResponse, good)
 	cookie := goodResponse.Header().Get("Set-Cookie")
@@ -155,53 +203,130 @@ func TestStateChangingOriginAndCookiePath(t *testing.T) {
 		}
 	}
 
-	compat := httptest.NewRequest(http.MethodPost, "/hifumi/api/v1/auth/logout", nil)
-	compat.Header.Set(compatSecretHeader, strings.Repeat("c", 32))
-	compat.Header.Set(compatOriginHeader, "https://stellafortuna.luminet.cn")
-	compatResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(compatResponse, compat)
-	compatCookie := compatResponse.Header().Get("Set-Cookie")
-	if !strings.Contains(compatCookie, "Path=/;") || strings.Contains(compatCookie, "Path=/hifumi/") {
-		t.Fatalf("compat logout did not clear the legacy root cookie: %q", compatCookie)
+	noOrigin := httptest.NewRequest(http.MethodPost, "/hifumi/v1/auth/logout", nil)
+	noOriginResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(noOriginResponse, noOrigin)
+	if noOriginResponse.Code != http.StatusForbidden {
+		t.Fatalf("state-changing request without Origin returned %d", noOriginResponse.Code)
 	}
-	compatEvil := httptest.NewRequest(http.MethodPost, "/hifumi/api/v1/auth/logout", nil)
-	compatEvil.Header.Set("Origin", "https://evil.example")
-	compatEvil.Header.Set(compatSecretHeader, strings.Repeat("c", 32))
-	compatEvil.Header.Set(compatOriginHeader, "https://stellafortuna.luminet.cn")
-	compatEvilResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(compatEvilResponse, compatEvil)
-	if compatEvilResponse.Code != http.StatusForbidden {
-		t.Fatalf("trusted proxy headers bypassed malicious browser origin: %d", compatEvilResponse.Code)
+	missingReferer := httptest.NewRequest(http.MethodPost, "/hifumi/v1/auth/logout", nil)
+	missingReferer.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	missingRefererResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(missingRefererResponse, missingReferer)
+	if missingRefererResponse.Code != http.StatusForbidden || !strings.Contains(missingRefererResponse.Body.String(), "invalid_referer") {
+		t.Fatalf("state-changing request without Referer returned %d %s", missingRefererResponse.Code, missingRefererResponse.Body.String())
+	}
+	badReferer := httptest.NewRequest(http.MethodPost, "/hifumi/v1/auth/logout", nil)
+	badReferer.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	badReferer.Header.Set("Referer", "https://evil.example/")
+	badRefererResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(badRefererResponse, badReferer)
+	if badRefererResponse.Code != http.StatusForbidden || !strings.Contains(badRefererResponse.Body.String(), "invalid_referer") {
+		t.Fatalf("unexpected bad-referer response: %d %s", badRefererResponse.Code, badRefererResponse.Body.String())
 	}
 }
 
-func TestCompatibilityLoginAndHandoffTrustBoundary(t *testing.T) {
+func TestInternalCompatibilityHandoffIsNotRouted(t *testing.T) {
+	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
+	request := httptest.NewRequest(http.MethodPost, "/hifumi/internal/compat/handoff", strings.NewReader(`{"code":"retired"}`))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("retired compatibility handoff returned %d", response.Code)
+	}
+}
+
+func TestOAuthReturnToFollowsAllowedRefererAndRejectsOpenRedirect(t *testing.T) {
 	oauth := &fakeOAuth{}
-	redis := &fakeRealtime{handoff: "session.jwt"}
-	server := testServer(t, &fakeTokens{}, oauth, redis)
-	login := httptest.NewRequest(http.MethodGet, "/hifumi/api/v1/auth/login/linuxdo?compat=1", nil)
+	server := testServer(t, &fakeTokens{}, oauth, &fakeRealtime{})
+
+	login := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/login/linuxdo", nil)
+	login.Header.Set("Referer", "https://stellafortuna.hifumi.luminet.cn/day/2026-07-13")
 	loginResponse := httptest.NewRecorder()
 	server.Handler().ServeHTTP(loginResponse, login)
-	if loginResponse.Code != http.StatusFound || !oauth.compat {
-		t.Fatalf("compat login was not preserved: status=%d compat=%t", loginResponse.Code, oauth.compat)
+	if loginResponse.Code != http.StatusFound || oauth.returnTo != "https://stellafortuna.hifumi.luminet.cn/" {
+		t.Fatalf("allowed Referer selected returnTo=%q status=%d", oauth.returnTo, loginResponse.Code)
 	}
 
-	forged := httptest.NewRequest(http.MethodPost, "/hifumi/internal/compat/handoff", strings.NewReader(`{"code":"handoff_0123456789abcdef"}`))
-	forged.Header.Set(compatSecretHeader, strings.Repeat("x", 32))
-	forged.Header.Set(compatOriginHeader, "https://stellafortuna.luminet.cn")
-	forgedResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(forgedResponse, forged)
-	if forgedResponse.Code != http.StatusForbidden {
-		t.Fatalf("forged proxy secret returned %d", forgedResponse.Code)
+	invalidLogin := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/login/linuxdo", nil)
+	invalidLogin.Header.Set("Referer", "https://evil.example/phishing")
+	invalidLoginResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(invalidLoginResponse, invalidLogin)
+	if invalidLoginResponse.Code != http.StatusFound || oauth.returnTo != "https://stellafortuna.luminet.cn/" {
+		t.Fatalf("invalid Referer did not fall back: returnTo=%q status=%d", oauth.returnTo, invalidLoginResponse.Code)
 	}
 
-	trusted := httptest.NewRequest(http.MethodPost, "/hifumi/internal/compat/handoff", strings.NewReader(`{"code":"handoff_0123456789abcdef"}`))
-	trusted.Header.Set(compatSecretHeader, strings.Repeat("c", 32))
-	trusted.Header.Set(compatOriginHeader, "https://stellafortuna.luminet.cn")
-	trustedResponse := httptest.NewRecorder()
-	server.Handler().ServeHTTP(trustedResponse, trusted)
-	if trustedResponse.Code != http.StatusOK || !strings.Contains(trustedResponse.Body.String(), `"token":"session.jwt"`) {
-		t.Fatalf("trusted handoff failed: %d %s", trustedResponse.Code, trustedResponse.Body.String())
+	callbackLocation := func(returnTo string) string {
+		t.Helper()
+		tokens := &fakeTokens{oauthClaims: &auth.OAuthClaims{ReturnTo: returnTo}}
+		provider := &fakeOAuth{profile: &auth.Profile{Subject: "42", Username: "hifumi"}}
+		callbackServer := testServer(t, tokens, provider, &fakeRealtime{})
+		callback := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/callback?code=test&state=test", nil)
+		callback.AddCookie(&http.Cookie{Name: oauthCookieName, Value: "signed-state"})
+		response := httptest.NewRecorder()
+		callbackServer.Handler().ServeHTTP(response, callback)
+		if response.Code != http.StatusFound {
+			t.Fatalf("callback returned %d %s", response.Code, response.Body.String())
+		}
+		return response.Header().Get("Location")
+	}
+	if got := callbackLocation("https://stellafortuna.hifumi.luminet.cn/"); got != "https://stellafortuna.hifumi.luminet.cn/" {
+		t.Fatalf("allowed signed returnTo became %q", got)
+	}
+	if got := callbackLocation("https://evil.example/steal"); got != "https://stellafortuna.luminet.cn/" {
+		t.Fatalf("untrusted signed returnTo became %q", got)
+	}
+
+	callbackFailureLocation := func(tokens *fakeTokens, provider *fakeOAuth) string {
+		t.Helper()
+		callbackServer := testServer(t, tokens, provider, &fakeRealtime{})
+		callback := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/callback?code=test&state=test", nil)
+		callback.AddCookie(&http.Cookie{Name: oauthCookieName, Value: "signed-state"})
+		response := httptest.NewRecorder()
+		callbackServer.Handler().ServeHTTP(response, callback)
+		if response.Code != http.StatusFound {
+			t.Fatalf("failed callback returned %d %s", response.Code, response.Body.String())
+		}
+		return response.Header().Get("Location")
+	}
+	secondaryClaims := &auth.OAuthClaims{ReturnTo: "https://stellafortuna.hifumi.luminet.cn/"}
+	for name, location := range map[string]string{
+		"upstream": callbackFailureLocation(&fakeTokens{oauthClaims: secondaryClaims}, &fakeOAuth{}),
+		"sign": callbackFailureLocation(
+			&fakeTokens{oauthClaims: secondaryClaims, signErr: errors.New("sign failed")},
+			&fakeOAuth{profile: &auth.Profile{Subject: "42"}},
+		),
+	} {
+		if !strings.HasPrefix(location, "https://stellafortuna.hifumi.luminet.cn/day/2026-07-13?") || !strings.Contains(location, "auth_error=oauth_failed") {
+			t.Fatalf("%s failure did not preserve initiating origin: %q", name, location)
+		}
+	}
+
+	unverified := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
+	unverifiedRequest := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/callback?code=test&state=test", nil)
+	unverifiedRequest.AddCookie(&http.Cookie{Name: oauthCookieName, Value: "invalid-state"})
+	unverifiedResponse := httptest.NewRecorder()
+	unverified.Handler().ServeHTTP(unverifiedResponse, unverifiedRequest)
+	if got := unverifiedResponse.Header().Get("Location"); !strings.HasPrefix(got, "https://stellafortuna.luminet.cn/day/2026-07-13?") {
+		t.Fatalf("unverified state did not fall back to primary origin: %q", got)
+	}
+}
+
+func TestGinRecoveryHidesPanicAndLogsStatus(t *testing.T) {
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	server := testServerWithLogger(t, &fakeTokens{}, &fakeOAuth{panic: true}, &fakeRealtime{}, logger)
+	request := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/login/linuxdo", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"error":"internal_error"`) {
+		t.Fatalf("unexpected panic response: %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "sensitive panic detail") {
+		t.Fatalf("panic detail leaked to client: %s", response.Body.String())
+	}
+	if !strings.Contains(logs.String(), "class=panic") || !strings.Contains(logs.String(), "status=500") {
+		t.Fatalf("panic/status missing from structured logs: %s", logs.String())
 	}
 }
 
@@ -212,17 +337,42 @@ func TestHealthVersionAndPreflight(t *testing.T) {
 		"/hifumi/version": `"commit":"abc"`,
 	} {
 		response := httptest.NewRecorder()
-		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("Referer", "https://monitoring.example/")
+		server.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), expected) {
 			t.Fatalf("%s returned %d %s", path, response.Code, response.Body.String())
 		}
 	}
-	preflight := httptest.NewRequest(http.MethodOptions, "/hifumi/api/v1/auth/logout", nil)
+	preflight := httptest.NewRequest(http.MethodOptions, "/hifumi/v1/auth/logout", nil)
 	preflight.Header.Set("Origin", "https://stellafortuna.luminet.cn")
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, preflight)
 	if response.Code != http.StatusNoContent || response.Header().Get("Access-Control-Allow-Methods") == "" {
 		t.Fatalf("unexpected preflight: %d", response.Code)
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/hifumi/v1/auth/callback?code=test&state=test", nil)
+	callbackResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(callbackResponse, callback)
+	if callbackResponse.Code != http.StatusFound {
+		t.Fatalf("OAuth callback without Referer returned %d", callbackResponse.Code)
+	}
+	wrongMethod := httptest.NewRequest(http.MethodPost, "/hifumi/healthz", nil)
+	wrongMethodResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(wrongMethodResponse, wrongMethod)
+	if wrongMethodResponse.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method returned %d", wrongMethodResponse.Code)
+	}
+}
+
+func TestLegacyPublicAPIPrefixIsNotRouted(t *testing.T) {
+	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
+	request := httptest.NewRequest(http.MethodGet, "/hifumi/api/v1/auth/session", nil)
+	request.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("legacy public API prefix returned %d", response.Code)
 	}
 }
 
@@ -241,7 +391,7 @@ func TestWebSocketHandshakePingAndRPC(t *testing.T) {
 		},
 		Subprotocols: []string{SyncWebSocketProtocol},
 	}
-	connection, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/hifumi/api/v1/sync/ws", options)
+	connection, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/hifumi/v1/sync/ws", options)
 	if err != nil {
 		t.Fatalf("dial websocket: response=%v err=%v", response, err)
 	}
@@ -274,13 +424,30 @@ func TestWebSocketHandshakePingAndRPC(t *testing.T) {
 
 func TestWebSocketRequiresUpgradeBeforeAllocatingLease(t *testing.T) {
 	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
-	request := httptest.NewRequest(http.MethodGet, "/hifumi/api/v1/sync/ws", nil)
+	request := httptest.NewRequest(http.MethodGet, "/hifumi/v1/sync/ws", nil)
 	request.Header.Set("Origin", "https://stellafortuna.luminet.cn")
 	request.Header.Set("Sec-WebSocket-Protocol", SyncWebSocketProtocol)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusUpgradeRequired || response.Header().Get("Upgrade") != "websocket" {
 		t.Fatalf("unexpected upgrade response: %d %v", response.Code, response.Header())
+	}
+}
+
+func TestWebSocketRejectsForeignReferer(t *testing.T) {
+	server := testServer(t, &fakeTokens{}, &fakeOAuth{}, &fakeRealtime{})
+	for _, referer := range []string{"https://evil.example/", "https://stellafortuna.hifumi.luminet.cn/"} {
+		request := httptest.NewRequest(http.MethodGet, "/hifumi/v1/sync/ws", nil)
+		request.Header.Set("Connection", "Upgrade")
+		request.Header.Set("Upgrade", "websocket")
+		request.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+		request.Header.Set("Referer", referer)
+		request.Header.Set("Sec-WebSocket-Protocol", SyncWebSocketProtocol)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "invalid_referer") {
+			t.Fatalf("unexpected Referer %q response: %d %s", referer, response.Code, response.Body.String())
+		}
 	}
 }
 
@@ -299,12 +466,13 @@ func TestHTTPAndWebSocketReturnByteEquivalentProtobuf(t *testing.T) {
 		t.Fatal(err)
 	}
 	envelope := `{"protobuf":"` + base64.StdEncoding.EncodeToString(requestBytes) + `"}`
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/hifumi/api/v1/sync/exchange", strings.NewReader(envelope))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/hifumi/v1/sync/exchange", strings.NewReader(envelope))
 	if err != nil {
 		t.Fatal(err)
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Origin", "https://stellafortuna.luminet.cn")
+	httpRequest.Header.Set("Referer", "https://stellafortuna.luminet.cn/")
 	httpRequest.Header.Set("Cookie", "stella_session=test-token")
 	httpResponse, err := http.DefaultClient.Do(httpRequest)
 	if err != nil {
@@ -318,7 +486,7 @@ func TestHTTPAndWebSocketReturnByteEquivalentProtobuf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/hifumi/api/v1/sync/ws", &websocket.DialOptions{
+	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/hifumi/v1/sync/ws", &websocket.DialOptions{
 		HTTPHeader: http.Header{
 			"Origin": []string{"https://stellafortuna.luminet.cn"},
 			"Cookie": []string{"stella_session=test-token"},

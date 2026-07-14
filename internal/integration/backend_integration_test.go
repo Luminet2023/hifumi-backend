@@ -273,17 +273,6 @@ func TestRedisSharedLimitsLeasesPubSubHandoffAndOutbox(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for cross-instance hint")
 	}
-	code, err := first.PutHandoff(ctx, "session.jwt", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token, err := second.ConsumeHandoff(ctx, code); err != nil || token != "session.jwt" {
-		t.Fatalf("consume handoff: token=%q err=%v", token, err)
-	}
-	if token, err := first.ConsumeHandoff(ctx, code); err != nil || token != "" {
-		t.Fatalf("handoff was not one-time: token=%q err=%v", token, err)
-	}
-
 	db := integrationDB(t)
 	store := mysqlstore.New(db)
 	service := syncservice.NewService(store)

@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -16,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -25,15 +25,14 @@ import (
 	"github.com/Luminet2023/hifumi-backend/internal/config"
 	"github.com/Luminet2023/hifumi-backend/internal/realtime"
 	syncservice "github.com/Luminet2023/hifumi-backend/internal/sync"
+	"github.com/gin-gonic/gin"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	sessionCookieName  = "stella_session"
-	oauthCookieName    = "stella_oauth"
-	cookiePath         = "/hifumi/"
-	compatSecretHeader = "X-Compat-Proxy-Secret"
-	compatOriginHeader = "X-Compat-External-Origin"
+	sessionCookieName = "stella_session"
+	oauthCookieName   = "stella_oauth"
+	cookiePath        = "/hifumi/"
 )
 
 type BuildInfo struct {
@@ -44,12 +43,12 @@ type BuildInfo struct {
 
 type TokenManager interface {
 	SignSession(auth.Profile) (string, time.Time, error)
-	VerifySession(string, bool) (*auth.SessionClaims, error)
+	VerifySession(string) (*auth.SessionClaims, error)
 	VerifyOAuthState(string, string) (*auth.OAuthClaims, error)
 }
 
 type OAuthProvider interface {
-	Begin(bool) (auth.Login, error)
+	Begin(string) (auth.Login, error)
 	Complete(context.Context, string, *auth.OAuthClaims) (auth.Profile, error)
 }
 
@@ -68,8 +67,6 @@ type RealtimeClient interface {
 	AcquireConnection(context.Context, string, string, int, time.Duration) error
 	RefreshConnection(context.Context, string, string, time.Duration) (bool, error)
 	ReleaseConnection(context.Context, string, string) error
-	PutHandoff(context.Context, string, time.Duration) (string, error)
-	ConsumeHandoff(context.Context, string) (string, error)
 }
 
 type Dependencies struct {
@@ -100,7 +97,7 @@ type Server struct {
 	logger            *slog.Logger
 	build             BuildInfo
 	now               func() time.Time
-	mux               *http.ServeMux
+	router            *gin.Engine
 	trustedProxyCIDRs []*net.IPNet
 }
 
@@ -118,7 +115,6 @@ func NewServer(deps Dependencies) (*Server, error) {
 		cfg: deps.Config, tokens: deps.Tokens, oauth: deps.OAuth, profiles: deps.Profiles,
 		sync: deps.Sync, realtime: deps.Realtime, hub: deps.Hub, db: deps.DB,
 		checkSchema: deps.CheckSchema, logger: deps.Logger, build: deps.Build, now: deps.Now,
-		mux: http.NewServeMux(),
 	}
 	for _, raw := range deps.Config.TrustedProxyCIDRs {
 		_, network, err := net.ParseCIDR(raw)
@@ -127,27 +123,44 @@ func NewServer(deps Dependencies) (*Server, error) {
 		}
 		server.trustedProxyCIDRs = append(server.trustedProxyCIDRs, network)
 	}
+	// 本服务自行输出结构化请求日志，关闭 Gin 的路由调试输出。
+	gin.SetMode(gin.ReleaseMode)
+	server.router = gin.New()
+	server.router.RedirectTrailingSlash = false
+	server.router.RedirectFixedPath = false
+	server.router.HandleMethodNotAllowed = true
+	if err := server.router.SetTrustedProxies(nil); err != nil {
+		return nil, fmt.Errorf("disable Gin trusted proxies: %w", err)
+	}
+	server.router.Use(server.requestLog(), server.recovery(), server.securityHeaders(), server.cors())
 	server.routes()
 	return server, nil
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.requestLog(s.securityHeaders(s.cors(s.mux)))
+	return s.router
 }
 
 func (s *Server) routes() {
 	path := s.cfg.PublicPath
-	s.mux.HandleFunc("GET "+path("healthz"), s.health)
-	s.mux.HandleFunc("GET "+path("readyz"), s.ready)
-	s.mux.HandleFunc("GET "+path("version"), s.version)
-	s.mux.HandleFunc("GET "+path("api/v1/auth/login/linuxdo"), s.login)
-	s.mux.HandleFunc("GET "+path("api/v1/auth/callback"), s.callback)
-	s.mux.HandleFunc("GET "+path("api/v1/auth/session"), s.session)
-	s.mux.HandleFunc("POST "+path("api/v1/auth/logout"), s.logout)
-	s.mux.HandleFunc("POST "+path("api/v1/sync/exchange"), s.exchange)
-	s.mux.HandleFunc("POST "+path("api/v1/sync/resolve"), s.resolve)
-	s.mux.HandleFunc("GET "+path("api/v1/sync/ws"), s.webSocket)
-	s.mux.HandleFunc("POST "+path("internal/compat/handoff"), s.handoff)
+	s.router.GET(path("healthz"), ginHandler(s.health))
+	s.router.GET(path("readyz"), ginHandler(s.ready))
+	s.router.GET(path("version"), ginHandler(s.version))
+	s.router.GET(path("v1/auth/login/linuxdo"), ginHandler(s.login))
+	s.router.GET(path("v1/auth/callback"), ginHandler(s.callback))
+	s.router.GET(path("v1/auth/session"), ginHandler(s.session))
+	s.router.POST(path("v1/auth/logout"), ginHandler(s.logout))
+	s.router.POST(path("v1/sync/exchange"), ginHandler(s.exchange))
+	s.router.POST(path("v1/sync/resolve"), ginHandler(s.resolve))
+	s.router.GET(path("v1/sync/ws"), ginHandler(s.webSocket))
+	// CORS middleware 会在进入该处前完成 allowlist 校验并返回 204。
+	s.router.OPTIONS(path("v1/*path"), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+}
+
+func ginHandler(handler http.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		handler(c.Writer, c.Request)
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -177,9 +190,11 @@ func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	// compat 仅决定 OAuth 完成后是否生成一次性 handoff；它不放宽任何
-	// Session 验证或内部接口权限，因此旧 Worker 可以用浏览器重定向进入。
-	login, err := s.oauth.Begin(r.URL.Query().Get("compat") == "1")
+	returnTo := s.cfg.FrontendReturnURL.String()
+	if origin, ok := s.allowedRefererOrigin(r); ok {
+		returnTo = origin + "/"
+	}
+	login, err := s.oauth.Begin(returnTo)
 	if err != nil {
 		s.internalError(w, r, "oauth_begin", err)
 		return
@@ -191,11 +206,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
+	failureReturnTo := s.cfg.FrontendReturnURL.String()
 	fail := func(code string, err error) {
 		if err != nil {
 			s.logger.WarnContext(r.Context(), "oauth callback failed", "request_id", requestID(r.Context()), "class", code, "error", err)
 		}
-		target := *s.cfg.FrontendReturnURL
+		target, _ := url.Parse(s.validatedFrontendReturnURL(failureReturnTo))
 		target.Path = "/day/2026-07-13"
 		query := target.Query()
 		query.Set("auth_error", "oauth_failed")
@@ -221,6 +237,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		fail("invalid_oauth_state", err)
 		return
 	}
+	failureReturnTo = claims.ReturnTo
 	profile, err := s.oauth.Complete(r.Context(), code, claims)
 	if err != nil {
 		fail("oauth_upstream", err)
@@ -240,20 +257,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	setCookie(w, sessionCookieName, token, int(auth.SessionLifetime/time.Second))
 	clearCookie(w, oauthCookieName)
 	w.Header().Set("Cache-Control", "no-store")
-	if claims.Compat {
-		code, err := s.realtime.PutHandoff(r.Context(), token, time.Minute)
-		if err != nil {
-			fail("handoff_store", err)
-			return
-		}
-		target, _ := url.Parse(s.cfg.FrontendOrigin + "/api/v1/auth/handoff")
-		query := target.Query()
-		query.Set("code", code)
-		target.RawQuery = query.Encode()
-		w.Header().Set("Location", target.String())
-	} else {
-		w.Header().Set("Location", s.cfg.FrontendReturnURL.String())
-	}
+	w.Header().Set("Location", s.validatedFrontendReturnURL(claims.ReturnTo))
 	w.WriteHeader(http.StatusFound)
 }
 
@@ -290,11 +294,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusForbidden, "invalid_origin")
 		return
 	}
-	if s.isTrustedCompat(r) {
-		clearCookieAtPath(w, sessionCookieName, "/")
-	} else {
-		clearCookie(w, sessionCookieName)
-	}
+	clearCookie(w, sessionCookieName)
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 }
 
@@ -388,102 +388,154 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 	s.logger.InfoContext(r.Context(), "sync request completed", "request_id", requestID(r.Context()), "operation", operation, "state_changed", changed, "duration_ms", time.Since(started).Milliseconds())
 }
 
-func (s *Server) handoff(w http.ResponseWriter, r *http.Request) {
-	if !s.isTrustedCompat(r) {
-		writeAPIError(w, http.StatusForbidden, "compat_proxy_required")
-		return
-	}
-	var payload struct {
-		Code string `json:"code"`
-	}
-	if err := decodeLimitedJSON(r.Body, &payload, 1024); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "invalid_handoff_request")
-		return
-	}
-	token, err := s.realtime.ConsumeHandoff(r.Context(), payload.Code)
-	if err != nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "redis_unavailable")
-		return
-	}
-	if token == "" {
-		writeAPIError(w, http.StatusBadRequest, "invalid_handoff_code")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"token": token, "maxAge": int(auth.SessionLifetime / time.Second)})
-}
-
 func (s *Server) authenticate(r *http.Request) (*auth.SessionClaims, string, error) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		return nil, "", auth.ErrInvalidToken
 	}
-	claims, err := s.tokens.VerifySession(cookie.Value, s.isTrustedCompat(r))
+	claims, err := s.tokens.VerifySession(cookie.Value)
 	if err != nil {
 		return nil, "", err
 	}
 	return claims, auth.OwnerKey(claims.Subject), nil
 }
 
-func (s *Server) isTrustedCompat(r *http.Request) bool {
-	expected, provided := []byte(s.cfg.CompatProxySecret), []byte(r.Header.Get(compatSecretHeader))
-	return len(expected) > 0 && len(expected) == len(provided) && subtle.ConstantTimeCompare(expected, provided) == 1 &&
-		r.Header.Get(compatOriginHeader) == s.cfg.FrontendOrigin
-}
-
 func (s *Server) validStateOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
-	return origin == s.cfg.FrontendOrigin || (origin == "" && s.isTrustedCompat(r))
+	return s.isAllowedFrontendOrigin(origin) && s.validRefererForOrigin(r, true)
 }
 
-func (s *Server) cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) isAllowedFrontendOrigin(origin string) bool {
+	for _, allowed := range s.cfg.FrontendOrigins {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) validRefererForOrigin(r *http.Request, required bool) bool {
+	raw := strings.TrimSpace(r.Header.Get("Referer"))
+	if raw == "" {
+		return !required
+	}
+	refererOrigin, ok := s.allowedRefererOrigin(r)
+	return ok && refererOrigin == r.Header.Get("Origin")
+}
+
+func (s *Server) allowedRefererOrigin(r *http.Request) (string, bool) {
+	raw := strings.TrimSpace(r.Header.Get("Referer"))
+	if raw == "" {
+		return "", false
+	}
+	referer, err := url.Parse(raw)
+	if err != nil || referer.Scheme != "https" || referer.Host == "" || referer.User != nil {
+		return "", false
+	}
+	origin := referer.Scheme + "://" + referer.Host
+	return origin, s.isAllowedFrontendOrigin(origin)
+}
+
+func (s *Server) validatedFrontendReturnURL(raw string) string {
+	target, err := url.Parse(strings.TrimSpace(raw))
+	if err == nil && target.Scheme == "https" && target.Host != "" && target.User == nil &&
+		s.isAllowedFrontendOrigin(target.Scheme+"://"+target.Host) {
+		return target.String()
+	}
+	return s.cfg.FrontendReturnURL.String()
+}
+
+func (s *Server) requiresBrowserSource(path string) bool {
+	return path == s.cfg.PublicPath("v1/auth/session") ||
+		path == s.cfg.PublicPath("v1/auth/logout") ||
+		path == s.cfg.PublicPath("v1/sync/exchange") ||
+		path == s.cfg.PublicPath("v1/sync/resolve")
+}
+
+func (s *Server) cors() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		r, w := c.Request, c.Writer
 		origin := r.Header.Get("Origin")
-		isAPI := strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("api/")) || strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("internal/"))
-		if isAPI && origin != "" && origin != s.cfg.FrontendOrigin {
+		isAPI := strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("v1/"))
+		requiresSource := s.requiresBrowserSource(r.URL.Path) && r.Method != http.MethodOptions
+		if (requiresSource && !s.isAllowedFrontendOrigin(origin)) || (isAPI && origin != "" && !s.isAllowedFrontendOrigin(origin)) {
 			writeAPIError(w, http.StatusForbidden, "invalid_origin")
+			c.Abort()
 			return
 		}
-		if origin == s.cfg.FrontendOrigin {
+		if requiresSource && !s.validRefererForOrigin(r, true) {
+			writeAPIError(w, http.StatusForbidden, "invalid_referer")
+			c.Abort()
+			return
+		}
+		if r.URL.Path == s.cfg.PublicPath("v1/sync/ws") && !s.validRefererForOrigin(r, false) {
+			writeAPIError(w, http.StatusForbidden, "invalid_referer")
+			c.Abort()
+			return
+		}
+		if s.isAllowedFrontendOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")
 		}
-		if r.Method == http.MethodOptions && strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("api/")) {
-			if origin != s.cfg.FrontendOrigin {
+		if r.Method == http.MethodOptions && strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("v1/")) {
+			if !s.isAllowedFrontendOrigin(origin) {
 				writeAPIError(w, http.StatusForbidden, "invalid_origin")
+				c.Abort()
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.WriteHeader(http.StatusNoContent)
+			c.Abort()
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
-func (s *Server) securityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
+func (s *Server) securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("Cache-Control", "no-store")
+		c.Next()
+	}
+}
+
+func (s *Server) recovery() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.ErrorContext(c.Request.Context(), "http panic recovered",
+					"request_id", requestID(c.Request.Context()), "class", "panic", "error", fmt.Sprint(recovered),
+					"stack", string(debug.Stack()))
+				if !c.Writer.Written() {
+					writeAPIError(c.Writer, http.StatusInternalServerError, "internal_error")
+				}
+				c.Abort()
+			}
+		}()
+		c.Next()
+	}
 }
 
 type contextKey string
 
 const requestIDKey contextKey = "request_id"
 
-func (s *Server) requestLog(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) requestLog() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		r := c.Request
 		id := newRequestID()
 		ctx := context.WithValue(r.Context(), requestIDKey, id)
-		w.Header().Set("X-Request-Id", id)
+		c.Header("X-Request-Id", id)
 		started := time.Now()
-		next.ServeHTTP(w, r.WithContext(ctx))
-		s.logger.InfoContext(ctx, "http request", "request_id", id, "method", r.Method, "path", r.URL.Path, "client_ip", s.clientIP(r), "duration_ms", time.Since(started).Milliseconds())
-	})
+		c.Request = r.WithContext(ctx)
+		c.Next()
+		s.logger.InfoContext(ctx, "http request", "request_id", id, "method", r.Method, "path", r.URL.Path,
+			"status", c.Writer.Status(), "client_ip", s.clientIP(r), "duration_ms", time.Since(started).Milliseconds())
+	}
 }
 
 func (s *Server) clientIP(r *http.Request) string {
@@ -609,10 +661,6 @@ func setCookie(w http.ResponseWriter, name, value string, maxAge int) {
 
 func clearCookie(w http.ResponseWriter, name string) {
 	setCookie(w, name, "", -1)
-}
-
-func clearCookieAtPath(w http.ResponseWriter, name, path string) {
-	http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: path, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 
 func writeAPIError(w http.ResponseWriter, status int, code string) {

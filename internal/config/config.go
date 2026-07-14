@@ -11,19 +11,18 @@ import (
 
 const (
 	DefaultPublicBaseURL    = "https://api.luminet.cn/hifumi/"
-	DefaultFrontendOrigin   = "https://stellafortuna.luminet.cn"
+	DefaultFrontendOrigins  = "https://stellafortuna.hifumi.luminet.cn,https://stellafortuna.luminet.cn"
 	DefaultFrontendReturn   = "https://stellafortuna.luminet.cn/"
 	DefaultRedisKeyPrefix   = "study-list:prod:"
 	DefaultHTTPAddr         = ":8080"
 	DefaultSessionAudience  = "stellafortuna"
-	DefaultLegacyIssuer     = "https://stellafortuna.luminet.cn"
 	MinimumSigningSecretLen = 32
 )
 
 type Config struct {
 	HTTPAddr          string
 	PublicBaseURL     *url.URL
-	FrontendOrigin    string
+	FrontendOrigins   []string
 	FrontendReturnURL *url.URL
 	MySQLDSN          string
 	RedisURL          string
@@ -31,9 +30,7 @@ type Config struct {
 	LinuxDOClientID   string
 	LinuxDOSecret     string
 	SessionSecret     string
-	CompatProxySecret string
 	SessionAudience   string
-	LegacyIssuer      string
 	TrustedProxyCIDRs []string
 	LogLevel          string
 	ShutdownTimeout   time.Duration
@@ -57,19 +54,22 @@ func LoadFrom(lookup Lookup) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("PUBLIC_BASE_URL: %w", err)
 	}
-	frontendOrigin, err := normalizedOrigin(value("FRONTEND_ORIGIN", DefaultFrontendOrigin))
+	frontendOrigins, err := normalizedOrigins(value("FRONTEND_ORIGINS", DefaultFrontendOrigins))
 	if err != nil {
-		return Config{}, fmt.Errorf("FRONTEND_ORIGIN: %w", err)
+		return Config{}, fmt.Errorf("FRONTEND_ORIGINS: %w", err)
 	}
 	frontendReturn, err := url.Parse(value("FRONTEND_RETURN_URL", DefaultFrontendReturn))
-	if err != nil || frontendReturn.Scheme != "https" || frontendReturn.Host == "" {
+	if err != nil || frontendReturn.Scheme != "https" || frontendReturn.Host == "" || frontendReturn.User != nil {
 		return Config{}, fmt.Errorf("FRONTEND_RETURN_URL must be an absolute https URL")
+	}
+	if !contains(frontendOrigins, frontendReturn.Scheme+"://"+frontendReturn.Host) {
+		return Config{}, fmt.Errorf("FRONTEND_RETURN_URL origin must be listed in FRONTEND_ORIGINS")
 	}
 
 	cfg := Config{
 		HTTPAddr:          value("HTTP_ADDR", DefaultHTTPAddr),
 		PublicBaseURL:     publicBase,
-		FrontendOrigin:    frontendOrigin,
+		FrontendOrigins:   frontendOrigins,
 		FrontendReturnURL: frontendReturn,
 		MySQLDSN:          value("MYSQL_DSN", ""),
 		RedisURL:          value("REDIS_URL", ""),
@@ -77,9 +77,7 @@ func LoadFrom(lookup Lookup) (Config, error) {
 		LinuxDOClientID:   value("LINUXDO_CLIENT_ID", ""),
 		LinuxDOSecret:     value("LINUXDO_CLIENT_SECRET", ""),
 		SessionSecret:     value("SESSION_JWT_SECRET", ""),
-		CompatProxySecret: value("COMPAT_PROXY_SECRET", ""),
 		SessionAudience:   value("SESSION_AUDIENCE", DefaultSessionAudience),
-		LegacyIssuer:      value("LEGACY_SESSION_ISSUER", DefaultLegacyIssuer),
 		TrustedProxyCIDRs: splitCSV(value("TRUSTED_PROXY_CIDRS", "")),
 		LogLevel:          strings.ToLower(value("LOG_LEVEL", "info")),
 		ShutdownTimeout:   30 * time.Second,
@@ -94,7 +92,6 @@ func (c Config) ValidateServe() error {
 		"LINUXDO_CLIENT_ID":     c.LinuxDOClientID,
 		"LINUXDO_CLIENT_SECRET": c.LinuxDOSecret,
 		"SESSION_JWT_SECRET":    c.SessionSecret,
-		"COMPAT_PROXY_SECRET":   c.CompatProxySecret,
 	}
 	for name, value := range required {
 		if strings.TrimSpace(value) == "" {
@@ -103,9 +100,6 @@ func (c Config) ValidateServe() error {
 	}
 	if len(c.SessionSecret) < MinimumSigningSecretLen {
 		return fmt.Errorf("SESSION_JWT_SECRET must contain at least %d characters", MinimumSigningSecretLen)
-	}
-	if len(c.CompatProxySecret) < MinimumSigningSecretLen {
-		return fmt.Errorf("COMPAT_PROXY_SECRET must contain at least %d characters", MinimumSigningSecretLen)
 	}
 	for _, value := range c.TrustedProxyCIDRs {
 		if _, _, err := net.ParseCIDR(value); err != nil {
@@ -153,6 +147,38 @@ func normalizedOrigin(raw string) (string, error) {
 		return "", fmt.Errorf("must be an https origin without a path")
 	}
 	return u.Scheme + "://" + u.Host, nil
+}
+
+func normalizedOrigins(raw string) ([]string, error) {
+	items := splitCSV(raw)
+	if len(items) == 0 {
+		return nil, fmt.Errorf("must contain at least one https origin")
+	}
+	origins := make([]string, 0, len(items))
+	for _, item := range items {
+		origin, err := normalizedOrigin(item)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", item, err)
+		}
+		origins = appendUnique(origins, origin)
+	}
+	return origins, nil
+}
+
+func appendUnique(values []string, value string) []string {
+	if contains(values, value) {
+		return values
+	}
+	return append(values, value)
+}
+
+func contains(values []string, value string) bool {
+	for _, existing := range values {
+		if existing == value {
+			return true
+		}
+	}
+	return false
 }
 
 func splitCSV(value string) []string {
