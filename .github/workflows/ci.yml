@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: integration-password
+          MYSQL_DATABASE: study_list
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pintegration-password"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:8.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s
+          --health-timeout=5s --health-retries=20
+    env:
+      MYSQL_TEST_DSN: "root:integration-password@tcp(127.0.0.1:3306)/study_list?parseTime=true&charset=utf8mb4"
+      MYSQL_TEST_ADMIN_DSN: "root:integration-password@tcp(127.0.0.1:3306)/?parseTime=true&charset=utf8mb4"
+      REDIS_TEST_URL: "redis://127.0.0.1:6379/0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            printf 'Files require gofmt:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Build API
+        run: go build -mod=readonly -trimpath ./cmd/study-list-api
+
+  container:
+    name: Container build
+    needs: backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Build API image
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: study-list-api:ci
+          build-args: |
+            VERSION=ci
+            REVISION=${{ github.sha }}
+            BUILD_TIME=ci
+          cache-from: type=gha,scope=hifumi-backend-ci
+          cache-to: type=gha,mode=max,scope=hifumi-backend-ci
+
+      - name: Verify container contract
+        run: |
+          test "$(docker image inspect study-list-api:ci --format '{{.Config.User}}')" = "65532:65532"
+          docker image inspect study-list-api:ci --format '{{json .Config.Healthcheck.Test}}' | grep -F 'study-list-api'

@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package stella.sync.v1;
+
+option go_package = "github.com/Luminet2023/hifumi-backend/api/sync/v1;syncv1";
+
+// 这些字段编号必须与旧版 src/sync/protocol.js 保持一致。
+message Mutation {
+  string op_id = 1;
+  string entity_key = 2;
+  uint64 base_version = 3;
+  uint64 client_time_ms = 4;
+  bytes value_json = 5;
+  bool deleted = 6;
+  string device_id = 7;
+  uint64 client_seq = 8;
+}
+
+message MutationAck {
+  string op_id = 1;
+  uint64 server_cursor = 2;
+  bool conflict = 3;
+  bool applied = 4;
+}
+
+message Change {
+  uint64 cursor = 1;
+  string entity_key = 2;
+  bytes value_json = 3;
+  bool deleted = 4;
+  string device_id = 5;
+  uint64 client_time_ms = 6;
+  string op_id = 7;
+}
+
+message SyncRequest {
+  string device_id = 1;
+  uint64 cursor = 2;
+  repeated Mutation mutations = 3;
+  uint32 pull_limit = 4;
+  string baseline_id = 5;
+  uint64 local_version = 6;
+  uint64 local_updated_at_ms = 7;
+  string local_progress_day = 8;
+}
+
+message SyncResponse {
+  uint64 next_cursor = 1;
+  repeated MutationAck acks = 2;
+  repeated Change changes = 3;
+  bool has_more = 4;
+  bool reset_required = 5;
+  string baseline_id = 6;
+  uint64 server_version = 7;
+  uint64 server_updated_at_ms = 8;
+  string server_progress_day = 9;
+  bool baseline_mismatch = 10;
+}
+
+enum BaselineChoice {
+  BASELINE_CHOICE_UNSPECIFIED = 0;
+  BASELINE_CHOICE_USE_LOCAL = 1;
+  BASELINE_CHOICE_USE_SERVER = 2;
+}
+
+message ResolveBaselineRequest {
+  string request_id = 1;
+  string device_id = 2;
+  string local_baseline_id = 3;
+  string expected_server_baseline_id = 4;
+  uint64 expected_server_version = 5;
+  BaselineChoice choice = 6;
+  repeated Mutation local_snapshot = 7;
+  uint64 local_version = 8;
+  uint64 local_updated_at_ms = 9;
+  string local_progress_day = 10;
+}
+
+message ResolveBaselineResponse {
+  string baseline_id = 1;
+  uint64 server_version = 2;
+  uint64 server_updated_at_ms = 3;
+  string server_progress_day = 4;
+  repeated Change records = 5;
+  bool stale = 6;
+  uint64 server_cursor = 7;
+}

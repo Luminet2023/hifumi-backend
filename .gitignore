@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+/bin/
+/coverage/
+/dist/
+/tmp/
+
+*.log
+*.out
+/study-list-api

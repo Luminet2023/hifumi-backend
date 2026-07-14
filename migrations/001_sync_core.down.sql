@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS realtime_outbox;
+DROP TABLE IF EXISTS sync_archive_heads;
+DROP TABLE IF EXISTS sync_archive_changes;
+DROP TABLE IF EXISTS baseline_resolutions;
+DROP TABLE IF EXISTS sync_receipts;
+DROP TABLE IF EXISTS sync_operations;
+DROP TABLE IF EXISTS sync_records;
+DROP TABLE IF EXISTS sync_heads;
+DROP TABLE IF EXISTS user_profiles;
+DROP TABLE IF EXISTS sync_owners;
+DROP TABLE IF EXISTS schema_migrations;
