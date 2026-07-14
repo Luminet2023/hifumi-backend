@@ -307,17 +307,23 @@ func TestRedisSharedLimitsLeasesPubSubHandoffAndOutbox(t *testing.T) {
 			if received.OriginConnectionID != "writer" {
 				t.Fatalf("outbox lost origin connection: %+v", received)
 			}
-			var attempts uint64
-			var publishedAt sql.NullInt64
-			if err := db.QueryRowContext(ctx,
-				"SELECT publish_attempts, published_at_ms FROM realtime_outbox WHERE owner_key = ? ORDER BY id DESC LIMIT 1", owner,
-			).Scan(&attempts, &publishedAt); err != nil {
-				t.Fatal(err)
+			commitDeadline := time.Now().Add(3 * time.Second)
+			for {
+				var attempts uint64
+				var publishedAt sql.NullInt64
+				if err := db.QueryRowContext(ctx,
+					"SELECT publish_attempts, published_at_ms FROM realtime_outbox WHERE owner_key = ? ORDER BY id DESC LIMIT 1", owner,
+				).Scan(&attempts, &publishedAt); err != nil {
+					t.Fatal(err)
+				}
+				if attempts >= 2 && publishedAt.Valid {
+					return
+				}
+				if time.Now().After(commitDeadline) {
+					t.Fatalf("outbox did not retry and mark published: attempts=%d published=%v", attempts, publishedAt.Valid)
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
-			if attempts < 2 || !publishedAt.Valid {
-				t.Fatalf("outbox did not retry and mark published: attempts=%d published=%v", attempts, publishedAt.Valid)
-			}
-			return
 		case <-deadline:
 			t.Fatal("timed out waiting for outbox publication")
 		}
