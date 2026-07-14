@@ -6,7 +6,7 @@ x-api-security: &api-security
   image: *api-image
   network_mode: host
   env_file:
-    - .env
+    - 1panel.env
   read_only: true
   security_opt:
     - no-new-privileges:true
