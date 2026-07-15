@@ -22,6 +22,7 @@ import (
 const (
 	baselineA = "baseline_0123456789abcdef0123456789abcdef"
 	baselineB = "baseline_abcdef0123456789abcdef0123456789"
+	baselineC = "baseline_cccccccccccccccccccccccccccccccc"
 )
 
 type flakyPublisher struct {
@@ -94,7 +95,9 @@ func integrationDB(t *testing.T) *sql.DB {
 func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 	db := integrationDB(t)
 	store := mysqlstore.New(db)
-	service := syncservice.NewService(store)
+	service := syncservice.NewService(store, syncservice.WithBaselineIDGenerator(func() (string, error) {
+		return baselineC, nil
+	}))
 	subject := fmt.Sprintf("integration-%d", time.Now().UnixNano())
 	owner := auth.OwnerKey(subject)
 	metadata := syncservice.CommandMetadata{OwnerKey: owner}
@@ -210,6 +213,29 @@ func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 	}
 	if archiveA != 2 || archiveB != 1 {
 		t.Fatalf("cross-baseline archive was not preserved: A=%d B=%d", archiveA, archiveB)
+	}
+
+	restored, err := service.ResolveBaseline(ctx, metadata, &syncv1.ResolveBaselineRequest{
+		RequestId: "resolve_restore_a_01", DeviceId: "device_alpha", LocalBaselineId: baselineA,
+		ExpectedServerBaselineId: baselineB, ExpectedServerVersion: 1,
+		Choice: syncv1.BaselineChoice_BASELINE_CHOICE_USE_LOCAL,
+		LocalSnapshot: []*syncv1.Mutation{
+			mutation("snapshot_operation_a2", "stella/v1/day/2026-07-16/journal", `"restored"`),
+		},
+	})
+	if err != nil || restored.Response.GetStale() || restored.Response.GetBaselineId() != baselineC ||
+		restored.Response.GetServerVersion() != 1 {
+		t.Fatalf("restoring archived baseline did not fork a new lineage: result=%+v err=%v", restored, err)
+	}
+	var archiveC int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sync_archive_changes WHERE owner_key = ? AND baseline_id = ?", owner, baselineC).Scan(&archiveC); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sync_archive_changes WHERE owner_key = ? AND baseline_id = ?", owner, baselineA).Scan(&archiveA); err != nil {
+		t.Fatal(err)
+	}
+	if archiveA != 2 || archiveC != 1 {
+		t.Fatalf("restored lineage archive mismatch: A=%d C=%d", archiveA, archiveC)
 	}
 }
 

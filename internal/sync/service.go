@@ -300,6 +300,18 @@ func (s *Service) ResolveBaseline(
 			if err := validateLocalSnapshot(request); err != nil {
 				return err
 			}
+			resultBaselineID := request.GetLocalBaselineId()
+			if _, err := tx.GetArchiveHead(ctx, resultBaselineID); err == nil {
+				// 这个本地 baseline 曾经作为云端 lineage 使用过。若直接重用并把 cursor
+				// 重置为 1，会与不可变归档的 (baseline_id, cursor) 主键冲突，也会让仍
+				// 持有旧 cursor 的设备误以为这是同一轮 lineage。
+				resultBaselineID, err = s.newBaselineIDFunc()
+				if err != nil {
+					return err
+				}
+			} else if !errors.Is(err, ErrNotFound) {
+				return err
+			}
 			if err := tx.ClearCurrentBaseline(ctx); err != nil {
 				return err
 			}
@@ -339,7 +351,7 @@ func (s *Service) ResolveBaseline(
 				version = 1
 			}
 			lineage = Lineage{
-				BaselineID:  request.GetLocalBaselineId(),
+				BaselineID:  resultBaselineID,
 				Version:     version,
 				UpdatedAtMs: now,
 				ProgressDay: progressDay,

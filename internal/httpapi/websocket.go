@@ -202,7 +202,7 @@ func (s *Server) processWebSocketRPC(ctx context.Context, peer *realtime.Peer, o
 			return true
 		}
 		if err := syncservice.ValidateExchange(ownerKey, exchangeRequest); err != nil {
-			return s.enqueueOperationError(peer, frame.RequestID, err)
+			return s.enqueueOperationError(ctx, peer, ownerKey, frame.Type, frame.RequestID, err)
 		}
 	} else {
 		resolveRequest = &syncv1.ResolveBaselineRequest{}
@@ -211,7 +211,7 @@ func (s *Server) processWebSocketRPC(ctx context.Context, peer *realtime.Peer, o
 			return true
 		}
 		if err := syncservice.ValidateResolve(ownerKey, resolveRequest); err != nil {
-			return s.enqueueOperationError(peer, frame.RequestID, err)
+			return s.enqueueOperationError(ctx, peer, ownerKey, frame.Type, frame.RequestID, err)
 		}
 	}
 	limit, window := 8, 10*time.Second
@@ -220,6 +220,12 @@ func (s *Server) processWebSocketRPC(ctx context.Context, peer *realtime.Peer, o
 	}
 	retry, err := s.realtime.CheckFixedWindow(ctx, frame.Type, ownerKey, limit, window)
 	if err != nil {
+		s.logger.ErrorContext(ctx, "sync websocket rate limit failed",
+			"operation", frame.Type,
+			"owner_key", ownerKey,
+			"request_id", frame.RequestID,
+			"error", err,
+		)
 		s.enqueueWS(peer, mustServerError(frame.RequestID, "INTERNAL", 0))
 		return false
 	}
@@ -232,31 +238,59 @@ func (s *Server) processWebSocketRPC(ctx context.Context, peer *realtime.Peer, o
 	if exchangeRequest != nil {
 		result, err := s.sync.Exchange(ctx, metadata, exchangeRequest)
 		if err != nil {
-			return s.enqueueOperationError(peer, frame.RequestID, err)
+			return s.enqueueOperationError(ctx, peer, ownerKey, frame.Type, frame.RequestID, err)
 		}
 		response, resultType = result.Response, "exchange_result"
 	} else {
 		result, err := s.sync.ResolveBaseline(ctx, metadata, resolveRequest)
 		if err != nil {
-			return s.enqueueOperationError(peer, frame.RequestID, err)
+			return s.enqueueOperationError(ctx, peer, ownerKey, frame.Type, frame.RequestID, err)
 		}
 		response, resultType = result.Response, "resolve_result"
 	}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
 	if err != nil {
+		s.logger.ErrorContext(ctx, "sync websocket response marshal failed",
+			"operation", frame.Type,
+			"owner_key", ownerKey,
+			"request_id", frame.RequestID,
+			"error", err,
+		)
 		s.enqueueWS(peer, mustServerError(frame.RequestID, "INTERNAL", 0))
 		return false
 	}
 	message, err := EncodeServerResult(resultType, frame.RequestID, encoded)
-	return err == nil && s.enqueueWS(peer, message)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "sync websocket response encode failed",
+			"operation", frame.Type,
+			"owner_key", ownerKey,
+			"request_id", frame.RequestID,
+			"protobuf_bytes", len(encoded),
+			"error", err,
+		)
+		s.enqueueWS(peer, mustServerError(frame.RequestID, "INTERNAL", 0))
+		return false
+	}
+	return s.enqueueWS(peer, message)
 }
 
-func (s *Server) enqueueOperationError(peer *realtime.Peer, requestID string, err error) bool {
+func (s *Server) enqueueOperationError(
+	ctx context.Context,
+	peer *realtime.Peer,
+	ownerKey, operation, requestID string,
+	err error,
+) bool {
 	var operationError *syncservice.OperationError
 	if errors.As(err, &operationError) {
 		s.enqueueWS(peer, mustServerError(requestID, string(operationError.Code), 0))
 		return true
 	}
+	s.logger.ErrorContext(ctx, "sync websocket operation failed",
+		"operation", operation,
+		"owner_key", ownerKey,
+		"request_id", requestID,
+		"error", err,
+	)
 	s.enqueueWS(peer, mustServerError(requestID, "INTERNAL", 0))
 	return false
 }

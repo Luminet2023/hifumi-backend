@@ -37,6 +37,7 @@ type Tx interface {
 	InsertResolutionReceipt(ctx context.Context, receipt ResolutionReceipt) error
 	ClearCurrentBaseline(ctx context.Context) error
 
+	GetArchiveHead(ctx context.Context, baselineID string) (ArchiveHead, error)
 	ArchiveChange(ctx context.Context, baselineID string, serverVersion uint64, archivedAtMs uint64, change *syncv1.Change) error
 	UpsertArchiveHead(ctx context.Context, baselineID string, cursor uint64, serverVersion uint64, updatedAtMs uint64) error
 	InsertRealtimeEvent(ctx context.Context, event RealtimeEvent) error
@@ -66,6 +67,12 @@ type ResolutionReceipt struct {
 	ResultCursor             uint64
 	ResultVersion            uint64
 	ResultUpdatedAtMs        uint64
+}
+
+type ArchiveHead struct {
+	Cursor      uint64
+	Version     uint64
+	UpdatedAtMs uint64
 }
 
 type RealtimeEvent struct {

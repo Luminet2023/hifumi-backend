@@ -332,6 +332,21 @@ func (t *ownerTx) ClearCurrentBaseline(ctx context.Context) error {
 	return nil
 }
 
+func (t *ownerTx) GetArchiveHead(ctx context.Context, baselineID string) (synccore.ArchiveHead, error) {
+	var head synccore.ArchiveHead
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT `+"`cursor`"+`, server_version, updated_at_ms
+		 FROM sync_archive_heads
+		 WHERE owner_key = ? AND baseline_id = ?`,
+		t.ownerKey,
+		baselineID,
+	).Scan(&head.Cursor, &head.Version, &head.UpdatedAtMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return synccore.ArchiveHead{}, synccore.ErrNotFound
+	}
+	return head, err
+}
+
 func (t *ownerTx) ArchiveChange(
 	ctx context.Context,
 	baselineID string,

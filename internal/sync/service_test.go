@@ -227,6 +227,67 @@ func TestResolveBaselineCASUseLocalReplayAndEmptySnapshot(t *testing.T) {
 	}
 }
 
+func TestResolveBaselineUseLocalForksPreviouslyArchivedBaseline(t *testing.T) {
+	store := newMemoryStore()
+	service := newTestService(store)
+	ctx := context.Background()
+	metadata := CommandMetadata{OwnerKey: testOwner, OriginConnectionID: "connection_resolver"}
+
+	if _, err := service.Exchange(ctx, metadata, &syncv1.SyncRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA,
+		Mutations: []*syncv1.Mutation{
+			testMutation("operation_original_a", "stella/v1/day/2026-07-13/journal", "device_alpha", 0, `"original A"`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ResolveBaseline(ctx, metadata, &syncv1.ResolveBaselineRequest{
+		RequestId:                "resolution_switch_to_b",
+		DeviceId:                 "device_beta",
+		LocalBaselineId:          testBaselineB,
+		ExpectedServerBaselineId: testBaselineA,
+		ExpectedServerVersion:    1,
+		Choice:                   syncv1.BaselineChoice_BASELINE_CHOICE_USE_LOCAL,
+		LocalSnapshot: []*syncv1.Mutation{
+			testMutation("operation_snapshot_b", "stella/v1/day/2026-07-14/journal", "device_beta", 0, `"snapshot B"`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreRequest := &syncv1.ResolveBaselineRequest{
+		RequestId:                "resolution_restore_a",
+		DeviceId:                 "device_alpha",
+		LocalBaselineId:          testBaselineA,
+		ExpectedServerBaselineId: testBaselineB,
+		ExpectedServerVersion:    1,
+		Choice:                   syncv1.BaselineChoice_BASELINE_CHOICE_USE_LOCAL,
+		LocalSnapshot: []*syncv1.Mutation{
+			testMutation("operation_restored_a", "stella/v1/day/2026-07-15/journal", "device_alpha", 0, `"restored A"`),
+		},
+	}
+	result, err := service.ResolveBaseline(ctx, metadata, restoreRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaselineID != testBaselineC || result.Response.GetBaselineId() != testBaselineC {
+		t.Fatalf("restored archived baseline was not forked: %+v", result)
+	}
+	if result.ServerCursor != 1 || result.ServerVersion != 1 || len(result.Response.GetRecords()) != 1 {
+		t.Fatalf("unexpected restored snapshot result: %+v", result.Response)
+	}
+	if _, exists := store.owners[testOwner].archives[testBaselineA+":"+strings.Repeat("0", 15)+"1"]; !exists {
+		t.Fatal("original baseline archive was lost")
+	}
+	replay, err := service.ResolveBaseline(ctx, metadata, restoreRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.StateChanged || !proto.Equal(result.Response, replay.Response) {
+		t.Fatalf("forked resolution replay changed result: first=%v replay=%v", result.Response, replay.Response)
+	}
+}
+
 func TestResolutionRequestIDReuseWithDifferentChoiceFails(t *testing.T) {
 	store := newMemoryStore()
 	service := newTestService(store)
@@ -392,8 +453,19 @@ func (t *memoryTx) ClearCurrentBaseline(context.Context) error {
 	t.resolutions = make(map[string]ResolutionReceipt)
 	return nil
 }
+func (t *memoryTx) GetArchiveHead(_ context.Context, baselineID string) (ArchiveHead, error) {
+	cursor, exists := t.heads[baselineID]
+	if !exists {
+		return ArchiveHead{}, ErrNotFound
+	}
+	return ArchiveHead{Cursor: cursor}, nil
+}
 func (t *memoryTx) ArchiveChange(_ context.Context, baselineID string, _ uint64, _ uint64, change *syncv1.Change) error {
-	t.archives[baselineID+":"+strings.Repeat("0", 16-lenUint(change.GetCursor()))+uintString(change.GetCursor())] = cloneChange(change)
+	key := baselineID + ":" + strings.Repeat("0", 16-lenUint(change.GetCursor())) + uintString(change.GetCursor())
+	if _, exists := t.archives[key]; exists {
+		return errors.New("duplicate archive key")
+	}
+	t.archives[key] = cloneChange(change)
 	return nil
 }
 func (t *memoryTx) UpsertArchiveHead(_ context.Context, baselineID string, cursor uint64, _ uint64, _ uint64) error {
