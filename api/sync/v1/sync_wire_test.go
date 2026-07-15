@@ -73,6 +73,25 @@ func TestJavaScriptWireGoldenFixtures(t *testing.T) {
 			fresh: func() proto.Message { return &SyncResponse{} },
 		},
 		{
+			name: "diff request",
+			message: &DiffRequest{
+				DeviceId: "d", Mutations: []*Mutation{mutation}, BaselineId: "b",
+				LocalVersion: 2, LocalUpdatedAtMs: 300, LocalProgressDay: "p",
+			},
+			hex:   "0a016412160a016f120165180120ac022a0200ff30013a016440021a0162200228ac02320170",
+			fresh: func() proto.Message { return &DiffRequest{} },
+		},
+		{
+			name: "diff response",
+			message: &DiffResponse{
+				Acks: []*MutationAck{ack}, CanonicalChanges: []*Change{change}, BaselineId: "b",
+				ServerCursor: 3, ServerVersion: 2, ServerUpdatedAtMs: 300,
+				ServerProgressDay: "p", BaselineMismatch: true,
+			},
+			hex:   "0a090a016f100118012001121408011201651a0200ff20012a016430ac023a016f1a01622003280230ac023a01704001",
+			fresh: func() proto.Message { return &DiffResponse{} },
+		},
+		{
 			name: "resolve request",
 			message: &ResolveBaselineRequest{
 				RequestId: "r", DeviceId: "d", LocalBaselineId: "l", ExpectedServerBaselineId: "s",
@@ -122,7 +141,7 @@ func TestJavaScriptWireGoldenFixtures(t *testing.T) {
 func TestDefaultMessagesEncodeToEmptyBytes(t *testing.T) {
 	messages := []proto.Message{
 		&Mutation{}, &MutationAck{}, &Change{}, &SyncRequest{}, &SyncResponse{},
-		&ResolveBaselineRequest{}, &ResolveBaselineResponse{},
+		&DiffRequest{}, &DiffResponse{}, &ResolveBaselineRequest{}, &ResolveBaselineResponse{},
 	}
 	for _, message := range messages {
 		encoded, err := proto.Marshal(message)

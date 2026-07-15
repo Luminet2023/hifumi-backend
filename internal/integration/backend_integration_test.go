@@ -92,7 +92,7 @@ func integrationDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
+func TestMySQLConcurrentDiffFeedReplayConflictAndBaselineArchive(t *testing.T) {
 	db := integrationDB(t)
 	store := mysqlstore.New(db)
 	service := syncservice.NewService(store, syncservice.WithBaselineIDGenerator(func() (string, error) {
@@ -116,15 +116,15 @@ func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 		t.Fatalf("empty email overwrote stored email: profile=%+v err=%v", profile, err)
 	}
 
-	seed, err := service.Exchange(ctx, metadata, request(baselineA, 0, nil, 128))
+	seed, err := service.Diff(ctx, metadata, diffRequest(baselineA, nil))
 	if err != nil || seed.Response.GetServerVersion() != 0 {
-		t.Fatalf("seed exchange: result=%+v err=%v", seed, err)
+		t.Fatalf("seed diff: result=%+v err=%v", seed, err)
 	}
 	mutations := []*syncv1.Mutation{
 		mutation("operation_alpha_0001", "stella/v1/day/2026-07-13/journal", `"alpha"`),
 		mutation("operation_beta_00002", "stella/v1/day/2026-07-14/journal", `"beta"`),
 	}
-	results := make(chan *syncservice.ExchangeResult, 2)
+	results := make(chan *syncservice.DiffResult, 2)
 	errorsChannel := make(chan error, 2)
 	var group sync.WaitGroup
 	for _, item := range mutations {
@@ -132,7 +132,7 @@ func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			result, callErr := service.Exchange(ctx, metadata, request(baselineA, 0, []*syncv1.Mutation{item}, 128))
+			result, callErr := service.Diff(ctx, metadata, diffRequest(baselineA, []*syncv1.Mutation{item}))
 			if callErr != nil {
 				errorsChannel <- callErr
 				return
@@ -154,19 +154,23 @@ func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 		t.Fatalf("concurrent batches did not serialize versions once each: %v", versions)
 	}
 
-	replay, err := service.Exchange(ctx, metadata, request(baselineA, 0, []*syncv1.Mutation{mutations[0]}, 1))
+	replay, err := service.Diff(ctx, metadata, diffRequest(baselineA, []*syncv1.Mutation{mutations[0]}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(replay.Response.GetAcks()) != 1 || !replay.Response.GetAcks()[0].GetApplied() || replay.StateChanged {
 		t.Fatalf("opId replay changed state: %+v", replay)
 	}
-	if !replay.Response.GetHasMore() {
-		t.Fatal("pull_limit=1 should paginate two operations")
+	if len(replay.Response.GetCanonicalChanges()) != 1 || replay.Response.GetCanonicalChanges()[0].GetOpId() != mutations[0].GetOpId() {
+		t.Fatalf("opId replay did not return its canonical operation: %+v", replay.Response)
+	}
+	feed, err := service.ReadFeedPage(ctx, owner, baselineA, 0, 1)
+	if err != nil || !feed.HasMore || len(feed.Changes) != 1 || feed.NextCursor != 1 || feed.HeadCursor != 2 {
+		t.Fatalf("feed limit=1 did not paginate two operations: page=%+v err=%v", feed, err)
 	}
 
 	conflicting := mutation("operation_conflict_01", mutations[0].GetEntityKey(), `"conflict"`)
-	conflict, err := service.Exchange(ctx, metadata, request(baselineA, 0, []*syncv1.Mutation{conflicting}, 128))
+	conflict, err := service.Diff(ctx, metadata, diffRequest(baselineA, []*syncv1.Mutation{conflicting}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +179,11 @@ func TestMySQLConcurrentExchangeReplayConflictAndBaselineArchive(t *testing.T) {
 		t.Fatalf("unexpected conflict ack: %+v", ack)
 	}
 
-	reset, err := service.Exchange(ctx, metadata, request(baselineA, 999, nil, 128))
-	if err != nil || !reset.Response.GetResetRequired() {
+	reset, err := service.ReadFeedPage(ctx, owner, baselineA, 999, 128)
+	if err != nil || !reset.ResetRequired {
 		t.Fatalf("cursor reset was not requested: result=%+v err=%v", reset, err)
 	}
-	mismatch, err := service.Exchange(ctx, metadata, request(baselineB, 0, nil, 128))
+	mismatch, err := service.Diff(ctx, metadata, diffRequest(baselineB, nil))
 	if err != nil || !mismatch.Response.GetBaselineMismatch() {
 		t.Fatalf("baseline mismatch was not returned: result=%+v err=%v", mismatch, err)
 	}
@@ -349,6 +353,13 @@ func request(baseline string, cursor uint64, mutations []*syncv1.Mutation, limit
 	return &syncv1.SyncRequest{
 		DeviceId: "device_alpha", Cursor: cursor, Mutations: mutations, PullLimit: limit,
 		BaselineId: baseline, LocalProgressDay: "2026-07-13",
+	}
+}
+
+func diffRequest(baseline string, mutations []*syncv1.Mutation) *syncv1.DiffRequest {
+	return &syncv1.DiffRequest{
+		DeviceId: "device_alpha", Mutations: mutations, BaselineId: baseline,
+		LocalProgressDay: "2026-07-13",
 	}
 }
 

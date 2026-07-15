@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
@@ -11,6 +12,175 @@ import (
 	syncv1 "github.com/Luminet2023/hifumi-backend/api/sync/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestDiffCanonicalChangesAppliedReplayConflictAndMismatch(t *testing.T) {
+	store := newMemoryStore()
+	service := newTestService(store)
+	firstRequest := &syncv1.DiffRequest{
+		DeviceId:   "device_alpha",
+		BaselineId: testBaselineA,
+		Mutations: []*syncv1.Mutation{
+			testMutation("operation_diff_0001", "stella/v1/preference/theme", "device_alpha", 0, `"light"`),
+			testMutation("operation_diff_0002", "stella/v1/preference/fontFamily", "device_alpha", 0, `"system"`),
+		},
+	}
+	first, err := service.Diff(context.Background(), CommandMetadata{
+		OwnerKey: testOwner, OriginConnectionID: "connection_diff_writer",
+	}, firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.StateChanged || first.ServerCursor != 2 || first.ServerVersion != 1 {
+		t.Fatalf("unexpected first diff: %+v", first)
+	}
+	if len(first.Response.GetAcks()) != 2 || len(first.Response.GetCanonicalChanges()) != 2 {
+		t.Fatalf("ack/canonical mismatch: %+v", first.Response)
+	}
+	for index, ack := range first.Response.GetAcks() {
+		canonical := first.Response.GetCanonicalChanges()[index]
+		if !ack.GetApplied() || ack.GetServerCursor() != canonical.GetCursor() || ack.GetOpId() != canonical.GetOpId() {
+			t.Fatalf("ack %d does not match canonical change: ack=%v change=%v", index, ack, canonical)
+		}
+	}
+
+	updated, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA,
+		Mutations: []*syncv1.Mutation{
+			testMutation("operation_diff_0003", "stella/v1/preference/theme", "device_alpha", 1, `"dark"`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ServerVersion != 2 || updated.ServerCursor != 3 {
+		t.Fatalf("unexpected update: %+v", updated)
+	}
+
+	replayAndConflict, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA,
+		Mutations: []*syncv1.Mutation{
+			firstRequest.GetMutations()[0],
+			testMutation("operation_diff_conflict", "stella/v1/preference/theme", "device_alpha", 0, `"stale"`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayAndConflict.StateChanged || replayAndConflict.ServerVersion != 2 || replayAndConflict.ServerCursor != 3 {
+		t.Fatalf("replay/conflict advanced state: %+v", replayAndConflict)
+	}
+	acks := replayAndConflict.Response.GetAcks()
+	canonical := replayAndConflict.Response.GetCanonicalChanges()
+	if len(acks) != 2 || len(canonical) != 2 {
+		t.Fatalf("ack/canonical mismatch: %+v", replayAndConflict.Response)
+	}
+	if canonical[0].GetCursor() != 1 || canonical[0].GetOpId() != "operation_diff_0001" {
+		t.Fatalf("receipt replay did not return immutable original operation: %+v", canonical[0])
+	}
+	if acks[1].GetApplied() || !acks[1].GetConflict() || acks[1].GetServerCursor() != 3 ||
+		canonical[1].GetCursor() != 3 || canonical[1].GetOpId() != "operation_diff_0003" {
+		t.Fatalf("conflict canonical mismatch: ack=%v change=%v", acks[1], canonical[1])
+	}
+
+	before := cloneMemoryTx(store.owners[testOwner])
+	mismatch, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineB,
+		Mutations: []*syncv1.Mutation{
+			testMutation("operation_wrong_diff", "stella/v1/preference/theme", "device_alpha", 3, `"ignored"`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mismatch.Response.GetBaselineMismatch() || mismatch.BaselineID != testBaselineA || mismatch.StateChanged {
+		t.Fatalf("baseline mismatch not returned: %+v", mismatch)
+	}
+	after := store.owners[testOwner]
+	if after.cursor != before.cursor || after.lineage.Version != before.lineage.Version ||
+		len(after.receipts) != len(before.receipts) || len(after.events) != len(before.events) {
+		t.Fatalf("baseline mismatch wrote state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestDiffResponseTooLargeRollsBackTransaction(t *testing.T) {
+	store := newMemoryStore()
+	service := newTestService(store)
+	seed := make([]*syncv1.Mutation, 0, 4)
+	conflicts := make([]*syncv1.Mutation, 0, 4)
+	largeValue := string(bytes.Repeat([]byte{'x'}, maxValueJSONBytes))
+	for index := 0; index < 4; index++ {
+		entityKey := "stella/v1/preference/large" + uintString(uint64(index))
+		seed = append(seed, testMutation("operation_large_seed_"+uintString(uint64(index)), entityKey, "device_alpha", 0, largeValue))
+		conflicts = append(conflicts, testMutation("operation_large_conflict_"+uintString(uint64(index)), entityKey, "device_alpha", 0, `"stale"`))
+	}
+	if _, err := service.Exchange(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.SyncRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA, Mutations: seed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := cloneMemoryTx(store.owners[testOwner])
+
+	result, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA, Mutations: conflicts,
+	})
+	if !errors.Is(err, ErrResponseTooLarge) || result != nil {
+		t.Fatalf("got result=%+v error=%v, want ErrResponseTooLarge", result, err)
+	}
+	after := store.owners[testOwner]
+	if after.cursor != before.cursor || after.lineage.Version != before.lineage.Version ||
+		len(after.receipts) != len(before.receipts) || len(after.events) != len(before.events) ||
+		len(after.archives) != len(before.archives) {
+		t.Fatalf("oversized response did not roll back: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestReadFeedPageEmptyPaginationMismatchAndReset(t *testing.T) {
+	store := newMemoryStore()
+	service := newTestService(store)
+	empty, err := service.ReadFeedPage(context.Background(), testOwner, testBaselineA, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.BaselineID != testBaselineA || empty.HeadCursor != 0 || empty.NextCursor != 0 ||
+		empty.ServerProgressDay != campaignStart || empty.BaselineMismatch || empty.ResetRequired {
+		t.Fatalf("unexpected empty feed: %+v", empty)
+	}
+
+	mutations := []*syncv1.Mutation{
+		testMutation("operation_feed_0001", "stella/v1/preference/feed1", "device_alpha", 0, `1`),
+		testMutation("operation_feed_0002", "stella/v1/preference/feed2", "device_alpha", 0, `2`),
+		testMutation("operation_feed_0003", "stella/v1/preference/feed3", "device_alpha", 0, `3`),
+	}
+	if _, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA, Mutations: mutations,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for cursor, wantNext := range []uint64{1, 2, 3} {
+		page, err := service.ReadFeedPage(context.Background(), testOwner, testBaselineA, uint64(cursor), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.NextCursor != wantNext || len(page.Changes) != 1 || page.Changes[0].GetCursor() != wantNext ||
+			page.HasMore != (wantNext < 3) || page.HeadCursor != 3 {
+			t.Fatalf("cursor %d returned unexpected page: %+v", cursor, page)
+		}
+	}
+	mismatch, err := service.ReadFeedPage(context.Background(), testOwner, testBaselineB, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mismatch.BaselineMismatch || mismatch.BaselineID != testBaselineA || len(mismatch.Changes) != 0 {
+		t.Fatalf("unexpected baseline mismatch page: %+v", mismatch)
+	}
+	reset, err := service.ReadFeedPage(context.Background(), testOwner, testBaselineA, 99, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reset.ResetRequired || reset.BaselineMismatch || len(reset.Changes) != 0 || reset.HeadCursor != 3 {
+		t.Fatalf("unexpected reset page: %+v", reset)
+	}
+}
 
 const (
 	testOwner     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -334,12 +504,32 @@ func newMemoryStore() *memoryStore {
 }
 
 func (s *memoryStore) WithOwnerTransaction(_ context.Context, ownerKey string, fn func(Tx) error) error {
-	state := s.owners[ownerKey]
+	state := cloneMemoryTx(s.owners[ownerKey])
 	if state == nil {
 		state = newMemoryTx()
-		s.owners[ownerKey] = state
 	}
-	return fn(state)
+	if err := fn(state); err != nil {
+		return err
+	}
+	s.owners[ownerKey] = state
+	return nil
+}
+
+func (s *memoryStore) ReadFeedSnapshot(
+	_ context.Context,
+	ownerKey string,
+	afterCursor uint64,
+	limit int,
+) (FeedSnapshot, error) {
+	state := s.owners[ownerKey]
+	if state == nil || state.lineage == nil {
+		return FeedSnapshot{}, ErrNotFound
+	}
+	changes, err := state.PullOperations(context.Background(), afterCursor, limit)
+	if err != nil {
+		return FeedSnapshot{}, err
+	}
+	return FeedSnapshot{Lineage: *state.lineage, HeadCursor: state.cursor, Changes: changes}, nil
 }
 
 type memoryTx struct {
@@ -405,6 +595,13 @@ func (t *memoryTx) ListRecords(context.Context) ([]*syncv1.Change, error) {
 		changes = append(changes, cloneChange(t.records[key]))
 	}
 	return changes, nil
+}
+func (t *memoryTx) GetOperation(_ context.Context, cursor uint64) (*syncv1.Change, error) {
+	change := t.operations[cursor]
+	if change == nil {
+		return nil, ErrNotFound
+	}
+	return cloneChange(change), nil
 }
 func (t *memoryTx) PullOperations(_ context.Context, afterCursor uint64, limit int) ([]*syncv1.Change, error) {
 	changes := make([]*syncv1.Change, 0)
@@ -479,6 +676,38 @@ func (t *memoryTx) InsertRealtimeEvent(_ context.Context, event RealtimeEvent) e
 
 func cloneChange(change *syncv1.Change) *syncv1.Change {
 	return proto.Clone(change).(*syncv1.Change)
+}
+
+func cloneMemoryTx(source *memoryTx) *memoryTx {
+	if source == nil {
+		return nil
+	}
+	clone := newMemoryTx()
+	clone.cursor = source.cursor
+	if source.lineage != nil {
+		lineage := *source.lineage
+		clone.lineage = &lineage
+	}
+	for key, change := range source.records {
+		clone.records[key] = cloneChange(change)
+	}
+	for cursor, change := range source.operations {
+		clone.operations[cursor] = cloneChange(change)
+	}
+	for opID, receipt := range source.receipts {
+		clone.receipts[opID] = receipt
+	}
+	for requestID, receipt := range source.resolutions {
+		clone.resolutions[requestID] = receipt
+	}
+	for key, change := range source.archives {
+		clone.archives[key] = cloneChange(change)
+	}
+	for baselineID, cursor := range source.heads {
+		clone.heads[baselineID] = cursor
+	}
+	clone.events = append([]RealtimeEvent(nil), source.events...)
+	return clone
 }
 
 func lenUint(value uint64) int { return len(uintString(value)) }

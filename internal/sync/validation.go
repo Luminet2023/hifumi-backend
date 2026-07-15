@@ -103,6 +103,38 @@ func ValidateExchange(ownerKey string, request *syncv1.SyncRequest) error {
 	return validateExchangeRequest(ownerKey, request)
 }
 
+func validateDiffRequest(ownerKey string, request *syncv1.DiffRequest) error {
+	if request == nil {
+		return invalidArgument("missing diff request")
+	}
+	if err := validateOwnerKey(ownerKey); err != nil {
+		return err
+	}
+	if err := validateDeviceID(request.GetDeviceId()); err != nil {
+		return err
+	}
+	if err := validateBaselineID(request.GetBaselineId(), "baseline_id"); err != nil {
+		return err
+	}
+	if len(request.GetMutations()) > maxMutations {
+		return invalidArgument("too many mutations")
+	}
+	if err := validateSafe(request.GetLocalVersion(), request.GetLocalUpdatedAtMs()); err != nil {
+		return err
+	}
+	for _, mutation := range request.GetMutations() {
+		if err := validateMutationWireNumbers(mutation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateDiff 在进入 Redis 限流前校验请求。Service 仍会在事务前再次校验。
+func ValidateDiff(ownerKey string, request *syncv1.DiffRequest) error {
+	return validateDiffRequest(ownerKey, request)
+}
+
 func validateResolveEnvelope(ownerKey string, request *syncv1.ResolveBaselineRequest) error {
 	if request == nil {
 		return invalidArgument("missing baseline resolution request")

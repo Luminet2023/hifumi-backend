@@ -16,7 +16,7 @@ const (
 	HintChannelName = "sync:hints"
 )
 
-var ErrConnectionLimit = errors.New("websocket connection limit reached")
+var ErrConnectionLimit = errors.New("sync connection limit reached")
 
 type Hint struct {
 	OwnerKey           string `json:"ownerKey"`

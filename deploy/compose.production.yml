@@ -23,6 +23,7 @@ services:
     <<: *api-security
     command: ["serve"]
     init: true
+    stop_grace_period: 35s
     depends_on:
       migrate:
         condition: service_completed_successfully

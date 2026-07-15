@@ -83,6 +83,76 @@ func (s *Store) WithOwnerTransaction(
 	return nil
 }
 
+func (s *Store) ReadFeedSnapshot(
+	ctx context.Context,
+	ownerKey string,
+	afterCursor uint64,
+	limit int,
+) (synccore.FeedSnapshot, error) {
+	// Feed 读取只需要一个很短的 REPEATABLE READ 一致性快照。这里不创建
+	// owner/head，也不使用 FOR UPDATE，因此 SSE 长连接不会持有事务或 owner 锁。
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return synccore.FeedSnapshot{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	snapshot := synccore.FeedSnapshot{}
+	err = tx.QueryRowContext(ctx,
+		`SELECT `+"`cursor`"+`, baseline_id, version, updated_at_ms, progress_day
+		 FROM sync_heads
+		 WHERE owner_key = ? AND baseline_id IS NOT NULL`,
+		ownerKey,
+	).Scan(
+		&snapshot.HeadCursor,
+		&snapshot.Lineage.BaselineID,
+		&snapshot.Lineage.Version,
+		&snapshot.Lineage.UpdatedAtMs,
+		&snapshot.Lineage.ProgressDay,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return synccore.FeedSnapshot{}, err
+		}
+		committed = true
+		return synccore.FeedSnapshot{}, synccore.ErrNotFound
+	}
+	if err != nil {
+		return synccore.FeedSnapshot{}, err
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT `+"`cursor`"+`, entity_key, value_json, deleted, device_id, client_time_ms, op_id
+		 FROM sync_operations
+		 WHERE owner_key = ? AND `+"`cursor`"+` > ?
+		 ORDER BY `+"`cursor`"+` ASC LIMIT ?`,
+		ownerKey,
+		afterCursor,
+		limit,
+	)
+	if err != nil {
+		return synccore.FeedSnapshot{}, err
+	}
+	snapshot.Changes, err = scanChanges(rows)
+	closeErr := rows.Close()
+	if err != nil {
+		return synccore.FeedSnapshot{}, err
+	}
+	if closeErr != nil {
+		return synccore.FeedSnapshot{}, closeErr
+	}
+	if err := tx.Commit(); err != nil {
+		return synccore.FeedSnapshot{}, err
+	}
+	committed = true
+	return snapshot, nil
+}
+
 type ownerTx struct {
 	tx       *sql.Tx
 	ownerKey string
@@ -184,6 +254,20 @@ func (t *ownerTx) ListRecords(ctx context.Context) ([]*syncv1.Change, error) {
 	}
 	defer rows.Close()
 	return scanChanges(rows)
+}
+
+func (t *ownerTx) GetOperation(ctx context.Context, cursor uint64) (*syncv1.Change, error) {
+	change, err := scanChange(t.tx.QueryRowContext(ctx,
+		`SELECT `+"`cursor`"+`, entity_key, value_json, deleted, device_id, client_time_ms, op_id
+		 FROM sync_operations
+		 WHERE owner_key = ? AND `+"`cursor`"+` = ?`,
+		t.ownerKey,
+		cursor,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, synccore.ErrNotFound
+	}
+	return change, err
 }
 
 func (t *ownerTx) PullOperations(ctx context.Context, afterCursor uint64, limit int) ([]*syncv1.Change, error) {

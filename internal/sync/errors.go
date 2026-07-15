@@ -1,6 +1,11 @@
 package sync
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrResponseTooLarge = errors.New("sync response is too large")
 
 type ErrorCode string
 

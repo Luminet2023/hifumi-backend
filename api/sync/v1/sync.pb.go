@@ -547,6 +547,190 @@ func (x *SyncResponse) GetBaselineMismatch() bool {
 	return false
 }
 
+type DiffRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId         string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	Mutations        []*Mutation            `protobuf:"bytes,2,rep,name=mutations,proto3" json:"mutations,omitempty"`
+	BaselineId       string                 `protobuf:"bytes,3,opt,name=baseline_id,json=baselineId,proto3" json:"baseline_id,omitempty"`
+	LocalVersion     uint64                 `protobuf:"varint,4,opt,name=local_version,json=localVersion,proto3" json:"local_version,omitempty"`
+	LocalUpdatedAtMs uint64                 `protobuf:"varint,5,opt,name=local_updated_at_ms,json=localUpdatedAtMs,proto3" json:"local_updated_at_ms,omitempty"`
+	LocalProgressDay string                 `protobuf:"bytes,6,opt,name=local_progress_day,json=localProgressDay,proto3" json:"local_progress_day,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DiffRequest) Reset() {
+	*x = DiffRequest{}
+	mi := &file_api_sync_v1_sync_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiffRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiffRequest) ProtoMessage() {}
+
+func (x *DiffRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_sync_v1_sync_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiffRequest.ProtoReflect.Descriptor instead.
+func (*DiffRequest) Descriptor() ([]byte, []int) {
+	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DiffRequest) GetDeviceId() string {
+	if x != nil {
+		return x.DeviceId
+	}
+	return ""
+}
+
+func (x *DiffRequest) GetMutations() []*Mutation {
+	if x != nil {
+		return x.Mutations
+	}
+	return nil
+}
+
+func (x *DiffRequest) GetBaselineId() string {
+	if x != nil {
+		return x.BaselineId
+	}
+	return ""
+}
+
+func (x *DiffRequest) GetLocalVersion() uint64 {
+	if x != nil {
+		return x.LocalVersion
+	}
+	return 0
+}
+
+func (x *DiffRequest) GetLocalUpdatedAtMs() uint64 {
+	if x != nil {
+		return x.LocalUpdatedAtMs
+	}
+	return 0
+}
+
+func (x *DiffRequest) GetLocalProgressDay() string {
+	if x != nil {
+		return x.LocalProgressDay
+	}
+	return ""
+}
+
+type DiffResponse struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Acks              []*MutationAck         `protobuf:"bytes,1,rep,name=acks,proto3" json:"acks,omitempty"`
+	CanonicalChanges  []*Change              `protobuf:"bytes,2,rep,name=canonical_changes,json=canonicalChanges,proto3" json:"canonical_changes,omitempty"`
+	BaselineId        string                 `protobuf:"bytes,3,opt,name=baseline_id,json=baselineId,proto3" json:"baseline_id,omitempty"`
+	ServerCursor      uint64                 `protobuf:"varint,4,opt,name=server_cursor,json=serverCursor,proto3" json:"server_cursor,omitempty"`
+	ServerVersion     uint64                 `protobuf:"varint,5,opt,name=server_version,json=serverVersion,proto3" json:"server_version,omitempty"`
+	ServerUpdatedAtMs uint64                 `protobuf:"varint,6,opt,name=server_updated_at_ms,json=serverUpdatedAtMs,proto3" json:"server_updated_at_ms,omitempty"`
+	ServerProgressDay string                 `protobuf:"bytes,7,opt,name=server_progress_day,json=serverProgressDay,proto3" json:"server_progress_day,omitempty"`
+	BaselineMismatch  bool                   `protobuf:"varint,8,opt,name=baseline_mismatch,json=baselineMismatch,proto3" json:"baseline_mismatch,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DiffResponse) Reset() {
+	*x = DiffResponse{}
+	mi := &file_api_sync_v1_sync_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiffResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiffResponse) ProtoMessage() {}
+
+func (x *DiffResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_sync_v1_sync_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiffResponse.ProtoReflect.Descriptor instead.
+func (*DiffResponse) Descriptor() ([]byte, []int) {
+	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *DiffResponse) GetAcks() []*MutationAck {
+	if x != nil {
+		return x.Acks
+	}
+	return nil
+}
+
+func (x *DiffResponse) GetCanonicalChanges() []*Change {
+	if x != nil {
+		return x.CanonicalChanges
+	}
+	return nil
+}
+
+func (x *DiffResponse) GetBaselineId() string {
+	if x != nil {
+		return x.BaselineId
+	}
+	return ""
+}
+
+func (x *DiffResponse) GetServerCursor() uint64 {
+	if x != nil {
+		return x.ServerCursor
+	}
+	return 0
+}
+
+func (x *DiffResponse) GetServerVersion() uint64 {
+	if x != nil {
+		return x.ServerVersion
+	}
+	return 0
+}
+
+func (x *DiffResponse) GetServerUpdatedAtMs() uint64 {
+	if x != nil {
+		return x.ServerUpdatedAtMs
+	}
+	return 0
+}
+
+func (x *DiffResponse) GetServerProgressDay() string {
+	if x != nil {
+		return x.ServerProgressDay
+	}
+	return ""
+}
+
+func (x *DiffResponse) GetBaselineMismatch() bool {
+	if x != nil {
+		return x.BaselineMismatch
+	}
+	return false
+}
+
 type ResolveBaselineRequest struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	RequestId                string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -565,7 +749,7 @@ type ResolveBaselineRequest struct {
 
 func (x *ResolveBaselineRequest) Reset() {
 	*x = ResolveBaselineRequest{}
-	mi := &file_api_sync_v1_sync_proto_msgTypes[5]
+	mi := &file_api_sync_v1_sync_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -577,7 +761,7 @@ func (x *ResolveBaselineRequest) String() string {
 func (*ResolveBaselineRequest) ProtoMessage() {}
 
 func (x *ResolveBaselineRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_sync_v1_sync_proto_msgTypes[5]
+	mi := &file_api_sync_v1_sync_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -590,7 +774,7 @@ func (x *ResolveBaselineRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveBaselineRequest.ProtoReflect.Descriptor instead.
 func (*ResolveBaselineRequest) Descriptor() ([]byte, []int) {
-	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{5}
+	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ResolveBaselineRequest) GetRequestId() string {
@@ -678,7 +862,7 @@ type ResolveBaselineResponse struct {
 
 func (x *ResolveBaselineResponse) Reset() {
 	*x = ResolveBaselineResponse{}
-	mi := &file_api_sync_v1_sync_proto_msgTypes[6]
+	mi := &file_api_sync_v1_sync_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -690,7 +874,7 @@ func (x *ResolveBaselineResponse) String() string {
 func (*ResolveBaselineResponse) ProtoMessage() {}
 
 func (x *ResolveBaselineResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_sync_v1_sync_proto_msgTypes[6]
+	mi := &file_api_sync_v1_sync_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -703,7 +887,7 @@ func (x *ResolveBaselineResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveBaselineResponse.ProtoReflect.Descriptor instead.
 func (*ResolveBaselineResponse) Descriptor() ([]byte, []int) {
-	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{6}
+	return file_api_sync_v1_sync_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ResolveBaselineResponse) GetBaselineId() string {
@@ -811,7 +995,25 @@ const file_api_sync_v1_sync_proto_rawDesc = "" +
 	"\x14server_updated_at_ms\x18\b \x01(\x04R\x11serverUpdatedAtMs\x12.\n" +
 	"\x13server_progress_day\x18\t \x01(\tR\x11serverProgressDay\x12+\n" +
 	"\x11baseline_mismatch\x18\n" +
-	" \x01(\bR\x10baselineMismatch\"\xf2\x03\n" +
+	" \x01(\bR\x10baselineMismatch\"\x85\x02\n" +
+	"\vDiffRequest\x12\x1b\n" +
+	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x126\n" +
+	"\tmutations\x18\x02 \x03(\v2\x18.stella.sync.v1.MutationR\tmutations\x12\x1f\n" +
+	"\vbaseline_id\x18\x03 \x01(\tR\n" +
+	"baselineId\x12#\n" +
+	"\rlocal_version\x18\x04 \x01(\x04R\flocalVersion\x12-\n" +
+	"\x13local_updated_at_ms\x18\x05 \x01(\x04R\x10localUpdatedAtMs\x12,\n" +
+	"\x12local_progress_day\x18\x06 \x01(\tR\x10localProgressDay\"\xff\x02\n" +
+	"\fDiffResponse\x12/\n" +
+	"\x04acks\x18\x01 \x03(\v2\x1b.stella.sync.v1.MutationAckR\x04acks\x12C\n" +
+	"\x11canonical_changes\x18\x02 \x03(\v2\x16.stella.sync.v1.ChangeR\x10canonicalChanges\x12\x1f\n" +
+	"\vbaseline_id\x18\x03 \x01(\tR\n" +
+	"baselineId\x12#\n" +
+	"\rserver_cursor\x18\x04 \x01(\x04R\fserverCursor\x12%\n" +
+	"\x0eserver_version\x18\x05 \x01(\x04R\rserverVersion\x12/\n" +
+	"\x14server_updated_at_ms\x18\x06 \x01(\x04R\x11serverUpdatedAtMs\x12.\n" +
+	"\x13server_progress_day\x18\a \x01(\tR\x11serverProgressDay\x12+\n" +
+	"\x11baseline_mismatch\x18\b \x01(\bR\x10baselineMismatch\"\xf2\x03\n" +
 	"\x16ResolveBaselineRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1b\n" +
@@ -852,7 +1054,7 @@ func file_api_sync_v1_sync_proto_rawDescGZIP() []byte {
 }
 
 var file_api_sync_v1_sync_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_api_sync_v1_sync_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_api_sync_v1_sync_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_api_sync_v1_sync_proto_goTypes = []any{
 	(BaselineChoice)(0),             // 0: stella.sync.v1.BaselineChoice
 	(*Mutation)(nil),                // 1: stella.sync.v1.Mutation
@@ -860,21 +1062,26 @@ var file_api_sync_v1_sync_proto_goTypes = []any{
 	(*Change)(nil),                  // 3: stella.sync.v1.Change
 	(*SyncRequest)(nil),             // 4: stella.sync.v1.SyncRequest
 	(*SyncResponse)(nil),            // 5: stella.sync.v1.SyncResponse
-	(*ResolveBaselineRequest)(nil),  // 6: stella.sync.v1.ResolveBaselineRequest
-	(*ResolveBaselineResponse)(nil), // 7: stella.sync.v1.ResolveBaselineResponse
+	(*DiffRequest)(nil),             // 6: stella.sync.v1.DiffRequest
+	(*DiffResponse)(nil),            // 7: stella.sync.v1.DiffResponse
+	(*ResolveBaselineRequest)(nil),  // 8: stella.sync.v1.ResolveBaselineRequest
+	(*ResolveBaselineResponse)(nil), // 9: stella.sync.v1.ResolveBaselineResponse
 }
 var file_api_sync_v1_sync_proto_depIdxs = []int32{
 	1, // 0: stella.sync.v1.SyncRequest.mutations:type_name -> stella.sync.v1.Mutation
 	2, // 1: stella.sync.v1.SyncResponse.acks:type_name -> stella.sync.v1.MutationAck
 	3, // 2: stella.sync.v1.SyncResponse.changes:type_name -> stella.sync.v1.Change
-	0, // 3: stella.sync.v1.ResolveBaselineRequest.choice:type_name -> stella.sync.v1.BaselineChoice
-	1, // 4: stella.sync.v1.ResolveBaselineRequest.local_snapshot:type_name -> stella.sync.v1.Mutation
-	3, // 5: stella.sync.v1.ResolveBaselineResponse.records:type_name -> stella.sync.v1.Change
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	1, // 3: stella.sync.v1.DiffRequest.mutations:type_name -> stella.sync.v1.Mutation
+	2, // 4: stella.sync.v1.DiffResponse.acks:type_name -> stella.sync.v1.MutationAck
+	3, // 5: stella.sync.v1.DiffResponse.canonical_changes:type_name -> stella.sync.v1.Change
+	0, // 6: stella.sync.v1.ResolveBaselineRequest.choice:type_name -> stella.sync.v1.BaselineChoice
+	1, // 7: stella.sync.v1.ResolveBaselineRequest.local_snapshot:type_name -> stella.sync.v1.Mutation
+	3, // 8: stella.sync.v1.ResolveBaselineResponse.records:type_name -> stella.sync.v1.Change
+	9, // [9:9] is the sub-list for method output_type
+	9, // [9:9] is the sub-list for method input_type
+	9, // [9:9] is the sub-list for extension type_name
+	9, // [9:9] is the sub-list for extension extendee
+	0, // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_api_sync_v1_sync_proto_init() }
@@ -888,7 +1095,7 @@ func file_api_sync_v1_sync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_sync_v1_sync_proto_rawDesc), len(file_api_sync_v1_sync_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -57,6 +57,26 @@ message SyncResponse {
   bool baseline_mismatch = 10;
 }
 
+message DiffRequest {
+  string device_id = 1;
+  repeated Mutation mutations = 2;
+  string baseline_id = 3;
+  uint64 local_version = 4;
+  uint64 local_updated_at_ms = 5;
+  string local_progress_day = 6;
+}
+
+message DiffResponse {
+  repeated MutationAck acks = 1;
+  repeated Change canonical_changes = 2;
+  string baseline_id = 3;
+  uint64 server_cursor = 4;
+  uint64 server_version = 5;
+  uint64 server_updated_at_ms = 6;
+  string server_progress_day = 7;
+  bool baseline_mismatch = 8;
+}
+
 enum BaselineChoice {
   BASELINE_CHOICE_UNSPECIFIED = 0;
   BASELINE_CHOICE_USE_LOCAL = 1;

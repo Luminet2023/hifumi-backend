@@ -106,9 +106,11 @@ func serve() error {
 	)
 	store := mysqlstore.New(db)
 	hub := realtime.NewHub()
+	wakeHub := realtime.NewWakeHub()
+	defer wakeHub.Close()
 	api, err := httpapi.NewServer(httpapi.Dependencies{
 		Config: cfg, Tokens: tokens, OAuth: provider, Profiles: store,
-		Sync: syncservice.NewService(store), Realtime: redisClient, Hub: hub, DB: db,
+		Sync: syncservice.NewService(store), Realtime: redisClient, Hub: hub, WakeHub: wakeHub, DB: db,
 		CheckSchema: func(ctx context.Context) error { return migrations.Check(ctx, db) },
 		Logger:      logger,
 		Build:       httpapi.BuildInfo{Version: version, Commit: commit, BuildTime: buildTime},
@@ -117,7 +119,7 @@ func serve() error {
 		return err
 	}
 
-	go runHintSubscriber(rootContext, redisClient, hub, logger)
+	go runHintSubscriber(rootContext, redisClient, hub, wakeHub, logger)
 	go func() {
 		if err := mysqlstore.RunOutbox(rootContext, db, redisClient, logger); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("realtime outbox stopped", "error", err)
@@ -147,6 +149,7 @@ func serve() error {
 	}
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
+	api.CloseStreams()
 	err = httpServer.Shutdown(shutdownContext)
 	cancelRequests()
 	return err
@@ -199,9 +202,12 @@ func healthcheck() error {
 	return nil
 }
 
-func runHintSubscriber(ctx context.Context, client *realtime.Client, hub *realtime.Hub, logger *slog.Logger) {
+func runHintSubscriber(ctx context.Context, client *realtime.Client, hub *realtime.Hub, wakeHub *realtime.WakeHub, logger *slog.Logger) {
 	for ctx.Err() == nil {
 		err := client.SubscribeHints(ctx, func(hint realtime.Hint) {
+			// Redis 只提供低延迟唤醒。SSE 收到通知后仍按 cursor 从 MySQL
+			// 读取实际 Change，并且不会过滤写入连接自身。
+			wakeHub.Publish(hint.OwnerKey)
 			payload, encodeErr := httpapi.EncodeSyncHint(hint.BaselineID, hint.ServerCursor, hint.ServerVersion)
 			if encodeErr == nil {
 				hub.Broadcast(hint, payload)

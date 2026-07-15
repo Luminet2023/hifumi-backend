@@ -110,6 +110,7 @@ func (s *Server) webSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.InfoContext(ctx, "sync websocket opened", "owner_key", ownerKey, "connection_id", connectionID)
+	s.logger.InfoContext(ctx, "legacy sync websocket upgrade succeeded", "owner_key", ownerKey, "connection_id", connectionID)
 	closeStatus, closeReason := websocket.StatusNormalClosure, "connection closed"
 	defer func() {
 		cancel()

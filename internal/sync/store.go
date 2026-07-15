@@ -13,6 +13,9 @@ var ErrNotFound = errors.New("sync row not found")
 // 该锁是 Durable Object 单用户串行语义在 MySQL 中的替代物。
 type Store interface {
 	WithOwnerTransaction(ctx context.Context, ownerKey string, fn func(Tx) error) error
+	// ReadFeedSnapshot 在短只读事务的一致性快照中读取当前 lineage/head
+	// 以及 afterCursor 之后的操作。实现不得获取 owner 写锁。
+	ReadFeedSnapshot(ctx context.Context, ownerKey string, afterCursor uint64, limit int) (FeedSnapshot, error)
 }
 
 type Tx interface {
@@ -26,6 +29,7 @@ type Tx interface {
 
 	GetRecord(ctx context.Context, entityKey string) (*syncv1.Change, error)
 	ListRecords(ctx context.Context) ([]*syncv1.Change, error)
+	GetOperation(ctx context.Context, cursor uint64) (*syncv1.Change, error)
 	PullOperations(ctx context.Context, afterCursor uint64, limit int) ([]*syncv1.Change, error)
 	AppendOperation(ctx context.Context, change *syncv1.Change) error
 	UpsertRecord(ctx context.Context, change *syncv1.Change) error
@@ -48,6 +52,12 @@ type Lineage struct {
 	Version     uint64
 	UpdatedAtMs uint64
 	ProgressDay string
+}
+
+type FeedSnapshot struct {
+	Lineage    Lineage
+	HeadCursor uint64
+	Changes    []*syncv1.Change
 }
 
 type Receipt struct {

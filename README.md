@@ -6,7 +6,7 @@
 https://api.luminet.cn/hifumi/
 ```
 
-反向代理应保留 `/hifumi` 前缀并透传 WebSocket Upgrade；应用监听容器内 `:8080`。OAuth callback 为：
+反向代理应保留 `/hifumi` 前缀；兼容期继续透传 WebSocket Upgrade，并为 SSE 关闭 buffering、cache 和 compression。应用监听容器内 `:8080`。OAuth callback 为：
 
 ```text
 https://api.luminet.cn/hifumi/v1/auth/callback
@@ -22,7 +22,7 @@ study-list-api migrate
 study-list-api healthcheck
 ```
 
-- `serve` 启动 HTTP/WebSocket API。
+- `serve` 启动 HTTP、SSE 与兼容期 WebSocket API。
 - `migrate` 只初始化或升级 MySQL schema；本项目不导入 Cloudflare KV/Durable Object 的旧数据。
 - `healthcheck` 请求本机 `/hifumi/healthz`，供 Docker `HEALTHCHECK` 使用。
 
@@ -70,11 +70,51 @@ docker run --rm --env-file /secure/path/study-list.env \
 
 应用启动时只校验 schema 版本，不应由每个 API replica 自动执行 DDL。部署流程必须保证 `migrate` 成功后再启动或滚动更新 `serve`。
 
-公开 API 统一位于 `/hifumi/v1/`，不再包含重复的 `/api` 路径段。Session、logout 和 HTTP sync 请求必须同时携带 allowlist 中的 `Origin` 与 `Referer`，且两者 origin 必须完全一致；CORS preflight 不要求 `Referer`。WebSocket 握手必须携带 allowlist `Origin`，为兼容浏览器可省略 `Referer`，但若携带也必须与 `Origin` 完全一致。健康检查、版本接口和 OAuth callback 不依赖这些浏览器来源头。
+公开 API 统一位于 `/hifumi/v1/`，不再包含重复的 `/api` 路径段。Session、logout、HTTP sync 与 SSE 请求必须同时携带 allowlist 中的 `Origin` 与 `Referer`，且两者 origin 必须完全一致；CORS preflight 不要求 `Referer`。WebSocket 握手必须携带 allowlist `Origin`，为兼容旧浏览器可省略 `Referer`，但若携带也必须与 `Origin` 完全一致。健康检查、版本接口和 OAuth callback 不依赖这些浏览器来源头。
 
 OAuth 登录会根据合法 `Referer` 选择两个前端域名之一，并把 return URL 写入签名 state；无效或缺失 `Referer` 时回退到 `FRONTEND_RETURN_URL`。Callback 会再次校验 return URL 的 origin，防止 open redirect；state 验证后的上游、资料或 Session 签名失败也会回到发起登录的前端域名。
 
-同步写入和 `realtime_outbox` 在同一 MySQL 事务提交；独立后台循环在提交后发布 Redis hint，失败会记录重试。Redis 故障不会改变 MySQL 中的 cursor、record、receipt 或用户资料，但会让同步请求、WebSocket 新连接和 `/readyz` 明确失败。
+同步写入和 `realtime_outbox` 在同一 MySQL 事务提交；独立后台循环在提交后发布 Redis hint，失败会记录重试。Redis Pub/Sub 只用于跨实例低延迟唤醒，SSE 收到 hint 后仍从 MySQL `sync_operations` 按 cursor 读取实际 Change，并每 30 秒主动核对一次 MySQL head。Redis 故障不会改变 MySQL 中的 cursor、record、receipt 或用户资料，但会让同步请求、SSE/WebSocket 新连接、连接续租和 `/readyz` 明确失败。
+
+## 同步 API
+
+新前端只使用以下接口：
+
+- `POST /hifumi/v1/sync/diff`：提交本地 mutation；请求和响应均为 `{"protobuf":"<base64>"}`，内部 Protobuf 使用 deterministic 编码。
+- `GET /hifumi/v1/sync/events?baselineId=<id>&cursor=<cursor>`：以 `fetch` 读取标准 SSE 变更流，必须发送 `Accept: text/event-stream` 和 Session Cookie。
+- `POST /hifumi/v1/sync/resolve`：保留 baseline CAS、归档、`USE_LOCAL` fork 与 `USE_SERVER` 语义。
+
+兼容期继续提供 `POST /hifumi/v1/sync/exchange` 和 `GET /hifumi/v1/sync/ws`。服务会结构化记录成功的旧 exchange 请求与 WebSocket upgrade，供连续 7 天零调用观察；新接口不会 fallback 到旧 transport。
+
+`DiffResponse.server_cursor` 只是服务端 head，客户端不能用它直接推进持久化全局 cursor。每个 Ack 都有一个 `canonical_changes` 条目，其 cursor 与 Ack 的 `server_cursor` 对应；成功写入、opId 幂等重放和冲突拒绝均返回权威 Change。只有连续应用 SSE Change 后才能推进 cursor。单个请求 Protobuf、响应 Protobuf和 SSE Protobuf 事件上限均为 512 KiB；若预计 Diff 响应超限，整个 mutation 事务会回滚并返回 HTTP `413` / `sync_response_too_large`，客户端应折半批次重试。
+
+SSE 事件包括：
+
+- `changes`：data 为 `{"version":1,"protobuf":"<base64 SyncResponse>"}`，Change 按 cursor 升序。
+- `ready`：无 Change 的 `SyncResponse`，表示已追赶到当时 MySQL head；空数据库也会发送。
+- `baseline_mismatch`：携带服务端 baseline 元数据并关闭流。
+- `reset_required`：要求客户端以 cursor 0 进入快照重建并重连。
+- `auth_required`、`unavailable`：data 为 `{"version":1,"code":"auth_required|unavailable"}`，发送后关闭流。
+
+带 Protobuf 的事件 ID 为 `<baselineId>:<nextCursor>`。服务每 15 秒发送 SSE comment heartbeat；每用户的 SSE 与兼容期 WebSocket 共用最多 8 条 Redis 连接租约，TTL 为 75 秒、每 25 秒续租。续租失败时 fail closed。SSE 不过滤写入者自身的 Change。
+
+SSE 反向代理必须采用等价于以下配置的行为（upstream 名称按实际部署调整）：
+
+```nginx
+location = /hifumi/v1/sync/events {
+    proxy_pass http://hifumi_api;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_cache off;
+    gzip off;
+    proxy_read_timeout 90s;
+    proxy_send_timeout 30s;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+应用同时设置 `Cache-Control: no-cache, no-store, no-transform` 与 `X-Accel-Buffering: no`，逐事件 flush，并给单次写入设置 10 秒 deadline。反向代理的 read timeout 必须明显大于 15 秒 heartbeat 周期。
 
 ## 本地 Compose 样例
 
@@ -130,11 +170,13 @@ docker pull ghcr.io/luminet2023/hifumi-backend@sha256:<digest>
 1. 将本分支合并到 `main`，等待 GHCR 多架构镜像、SBOM 和 provenance 完成，记录不可变 digest；仅在仓库支持时等待额外 attestation。
 2. 创建空 MySQL database；用该 digest 执行一次 `study-list-api migrate`。
 3. 以同一 digest 启动 `serve`，确认 `/hifumi/healthz`、`/hifumi/readyz` 和 `/hifumi/version`。
-4. 反向代理必须原样保留 `/hifumi` 前缀并支持 WebSocket Upgrade，不能 rewrite 成根 `/api`。
+4. 反向代理必须原样保留 `/hifumi` 前缀，按上文配置 SSE，并在兼容期支持 WebSocket Upgrade；不能 rewrite 成根 `/api`。
 5. 在 Linux DO 控制台把唯一 callback 设为 `https://api.luminet.cn/hifumi/v1/auth/callback`。
 6. 将 Cloudflare Worker 部署为纯静态 Assets Worker，并让已退役的 `/api/*` 路由统一返回 `410 Gone`。
 7. 发布带 `VITE_API_BASE_URL=https://api.luminet.cn/hifumi/` 的前端。
-8. 验证两个前端 origin 的 OAuth、Session、HTTP 同步、WSS、两标签页 hint 和容器重启恢复。切流后仅允许回滚到已验证的 Go 镜像 digest，不再把 Durable Object 恢复为权威源。
+8. 验证两个前端 origin 的 OAuth、Session、Diff、SSE cursor 续传、两标签页 hint、兼容期 WSS 和容器重启恢复。切流后仅允许回滚到已验证的 Go 镜像 digest，不再把 Durable Object 恢复为权威源。
+
+本次 Diff/SSE 双栈发布直接复用现有 `sync_operations` 与 `realtime_outbox`，不新增 schema migration，也不迁移或清空现有 MySQL 数据。新版前端发布后，任一次旧 `/sync/ws` 成功 upgrade 或 `/sync/exchange` 成功请求都会重置 7 天观察窗口；窗口完成后再单独删除旧 WebSocket 实现与依赖，并把两个旧路由收敛为轻量 `410 Gone`。
 
 旧 Cloudflare `/api/*` 后端已退役，不再代理、handoff 或接受旧 issuer Session；这些路由统一返回 `410 Gone`。
 
@@ -143,4 +185,4 @@ docker pull ghcr.io/luminet2023/hifumi-backend@sha256:<digest>
 - `/hifumi/healthz`：仅检查进程存活，不依赖 MySQL/Redis；Docker healthcheck 使用此端点。
 - `/hifumi/readyz`：以短超时检查 MySQL/Redis，供反向代理或编排系统决定是否接流量。
 
-容器关闭时会收到 `SIGTERM`；`serve` 必须先停止接收新请求，再在超时内完成 HTTP/WebSocket 优雅退出。
+容器关闭时会收到 `SIGTERM`；`serve` 会先主动取消全部 SSE stream，再执行 HTTP Server shutdown，并在超时内完成兼容期 WebSocket 退出。

@@ -74,6 +74,7 @@ services:
     build: *api-build
     command: ["serve"]
     init: true
+    stop_grace_period: 35s
     environment: *api-environment
     depends_on:
       mysql:

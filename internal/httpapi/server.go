@@ -58,6 +58,8 @@ type ProfileStore interface {
 
 type SyncService interface {
 	Exchange(context.Context, syncservice.CommandMetadata, *syncv1.SyncRequest) (*syncservice.ExchangeResult, error)
+	Diff(context.Context, syncservice.CommandMetadata, *syncv1.DiffRequest) (*syncservice.DiffResult, error)
+	ReadFeedPage(context.Context, string, string, uint64, int) (*syncservice.FeedPage, error)
 	ResolveBaseline(context.Context, syncservice.CommandMetadata, *syncv1.ResolveBaselineRequest) (*syncservice.ResolveResult, error)
 }
 
@@ -77,6 +79,7 @@ type Dependencies struct {
 	Sync        SyncService
 	Realtime    RealtimeClient
 	Hub         *realtime.Hub
+	WakeHub     *realtime.WakeHub
 	DB          *sql.DB
 	CheckSchema func(context.Context) error
 	Logger      *slog.Logger
@@ -92,6 +95,7 @@ type Server struct {
 	sync              SyncService
 	realtime          RealtimeClient
 	hub               *realtime.Hub
+	wakeHub           *realtime.WakeHub
 	db                *sql.DB
 	checkSchema       func(context.Context) error
 	logger            *slog.Logger
@@ -99,10 +103,12 @@ type Server struct {
 	now               func() time.Time
 	router            *gin.Engine
 	trustedProxyCIDRs []*net.IPNet
+	streamContext     context.Context
+	cancelStreams     context.CancelFunc
 }
 
 func NewServer(deps Dependencies) (*Server, error) {
-	if deps.Tokens == nil || deps.OAuth == nil || deps.Profiles == nil || deps.Sync == nil || deps.Realtime == nil || deps.Hub == nil {
+	if deps.Tokens == nil || deps.OAuth == nil || deps.Profiles == nil || deps.Sync == nil || deps.Realtime == nil || deps.Hub == nil || deps.WakeHub == nil {
 		return nil, fmt.Errorf("httpapi dependencies are incomplete")
 	}
 	if deps.Logger == nil {
@@ -111,10 +117,12 @@ func NewServer(deps Dependencies) (*Server, error) {
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
+	streamContext, cancelStreams := context.WithCancel(context.Background())
 	server := &Server{
 		cfg: deps.Config, tokens: deps.Tokens, oauth: deps.OAuth, profiles: deps.Profiles,
-		sync: deps.Sync, realtime: deps.Realtime, hub: deps.Hub, db: deps.DB,
+		sync: deps.Sync, realtime: deps.Realtime, hub: deps.Hub, wakeHub: deps.WakeHub, db: deps.DB,
 		checkSchema: deps.CheckSchema, logger: deps.Logger, build: deps.Build, now: deps.Now,
+		streamContext: streamContext, cancelStreams: cancelStreams,
 	}
 	for _, raw := range deps.Config.TrustedProxyCIDRs {
 		_, network, err := net.ParseCIDR(raw)
@@ -141,6 +149,12 @@ func (s *Server) Handler() http.Handler {
 	return s.router
 }
 
+// CloseStreams 主动取消全部 SSE 长连接。进程退出时必须先调用本方法，
+// 再执行 http.Server.Shutdown，避免 Shutdown 等待长连接自然结束。
+func (s *Server) CloseStreams() {
+	s.cancelStreams()
+}
+
 func (s *Server) routes() {
 	path := s.cfg.PublicPath
 	s.router.GET(path("healthz"), ginHandler(s.health))
@@ -151,7 +165,9 @@ func (s *Server) routes() {
 	s.router.GET(path("v1/auth/session"), ginHandler(s.session))
 	s.router.POST(path("v1/auth/logout"), ginHandler(s.logout))
 	s.router.POST(path("v1/sync/exchange"), ginHandler(s.exchange))
+	s.router.POST(path("v1/sync/diff"), ginHandler(s.diff))
 	s.router.POST(path("v1/sync/resolve"), ginHandler(s.resolve))
+	s.router.GET(path("v1/sync/events"), ginHandler(s.events))
 	s.router.GET(path("v1/sync/ws"), ginHandler(s.webSocket))
 	// CORS middleware 会在进入该处前完成 allowlist 校验并返回 204。
 	s.router.OPTIONS(path("v1/*path"), func(c *gin.Context) { c.Status(http.StatusNoContent) })
@@ -302,6 +318,10 @@ func (s *Server) exchange(w http.ResponseWriter, r *http.Request) {
 	s.handleSyncHTTP(w, r, "exchange")
 }
 
+func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
+	s.handleSyncHTTP(w, r, "diff")
+}
+
 func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 	s.handleSyncHTTP(w, r, "resolve")
 }
@@ -323,6 +343,7 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 	}
 	started := time.Now()
 	var exchangeRequest *syncv1.SyncRequest
+	var diffRequest *syncv1.DiffRequest
 	var resolveRequest *syncv1.ResolveBaselineRequest
 	if operation == "exchange" {
 		request := &syncv1.SyncRequest{}
@@ -335,6 +356,17 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 			return
 		}
 		exchangeRequest = request
+	} else if operation == "diff" {
+		request := &syncv1.DiffRequest{}
+		if err := proto.Unmarshal(body, request); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid_sync_envelope")
+			return
+		}
+		if err := syncservice.ValidateDiff(ownerKey, request); err != nil {
+			s.writeSyncError(w, r, err)
+			return
+		}
+		diffRequest = request
 	} else {
 		request := &syncv1.ResolveBaselineRequest{}
 		if err := proto.Unmarshal(body, request); err != nil {
@@ -351,7 +383,13 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 	if operation == "resolve" {
 		limit, window = 3, time.Minute
 	}
-	retry, err := s.realtime.CheckFixedWindow(r.Context(), operation, ownerKey, limit, window)
+	rateOperation := operation
+	if operation == "diff" {
+		// 新旧写入接口在兼容期共享同一个 owner 限流桶，避免客户端混用
+		// /diff 与 /exchange 将实际写入额度翻倍。日志仍保留 operation=diff。
+		rateOperation = "exchange"
+	}
+	retry, err := s.realtime.CheckFixedWindow(r.Context(), rateOperation, ownerKey, limit, window)
 	if err != nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "redis_unavailable")
 		return
@@ -370,6 +408,13 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 			return
 		}
 		response, changed = result.Response, result.StateChanged
+	} else if diffRequest != nil {
+		result, err := s.sync.Diff(r.Context(), syncservice.CommandMetadata{OwnerKey: ownerKey}, diffRequest)
+		if err != nil {
+			s.writeSyncError(w, r, err)
+			return
+		}
+		response, changed = result.Response, result.StateChanged
 	} else {
 		result, err := s.sync.ResolveBaseline(r.Context(), syncservice.CommandMetadata{OwnerKey: ownerKey}, resolveRequest)
 		if err != nil {
@@ -383,9 +428,16 @@ func (s *Server) handleSyncHTTP(w http.ResponseWriter, r *http.Request, operatio
 		s.internalError(w, r, "protobuf_marshal", err)
 		return
 	}
+	if len(encoded) > MaxProtobufBytes {
+		writeAPIError(w, http.StatusRequestEntityTooLarge, "sync_response_too_large")
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]string{"protobuf": base64.StdEncoding.EncodeToString(encoded)})
 	s.logger.InfoContext(r.Context(), "sync request completed", "request_id", requestID(r.Context()), "operation", operation, "state_changed", changed, "duration_ms", time.Since(started).Milliseconds())
+	if operation == "exchange" {
+		s.logger.InfoContext(r.Context(), "legacy sync exchange succeeded", "request_id", requestID(r.Context()), "owner_key", ownerKey)
+	}
 }
 
 func (s *Server) authenticate(r *http.Request) (*auth.SessionClaims, string, error) {
@@ -449,6 +501,8 @@ func (s *Server) requiresBrowserSource(path string) bool {
 	return path == s.cfg.PublicPath("v1/auth/session") ||
 		path == s.cfg.PublicPath("v1/auth/logout") ||
 		path == s.cfg.PublicPath("v1/sync/exchange") ||
+		path == s.cfg.PublicPath("v1/sync/diff") ||
+		path == s.cfg.PublicPath("v1/sync/events") ||
 		path == s.cfg.PublicPath("v1/sync/resolve")
 }
 
@@ -476,6 +530,7 @@ func (s *Server) cors() gin.HandlerFunc {
 		if s.isAllowedFrontendOrigin(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-Id")
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions && strings.HasPrefix(r.URL.Path, s.cfg.PublicPath("v1/")) {
@@ -576,6 +631,10 @@ func newRequestID() string {
 }
 
 func (s *Server) writeSyncError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, syncservice.ErrResponseTooLarge) {
+		writeAPIError(w, http.StatusRequestEntityTooLarge, "sync_response_too_large")
+		return
+	}
 	var operationError *syncservice.OperationError
 	if errors.As(err, &operationError) {
 		writeAPIError(w, http.StatusBadRequest, strings.ToLower(string(operationError.Code)))

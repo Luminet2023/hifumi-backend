@@ -82,6 +82,16 @@ func (*fakeSync) Exchange(context.Context, syncservice.CommandMetadata, *syncv1.
 		NextCursor: 3, BaselineId: "baseline_0123456789abcdef0123456789abcdef", ServerVersion: 2,
 	}}, nil
 }
+func (*fakeSync) Diff(_ context.Context, _ syncservice.CommandMetadata, request *syncv1.DiffRequest) (*syncservice.DiffResult, error) {
+	return &syncservice.DiffResult{Response: &syncv1.DiffResponse{
+		BaselineId: request.GetBaselineId(), ServerCursor: 3, ServerVersion: 2,
+	}}, nil
+}
+func (*fakeSync) ReadFeedPage(_ context.Context, _ string, baselineID string, cursor uint64, _ int) (*syncservice.FeedPage, error) {
+	return &syncservice.FeedPage{
+		NextCursor: cursor, HeadCursor: cursor, BaselineID: baselineID, ServerProgressDay: "2026-07-13",
+	}, nil
+}
 func (*fakeSync) ResolveBaseline(context.Context, syncservice.CommandMetadata, *syncv1.ResolveBaselineRequest) (*syncservice.ResolveResult, error) {
 	return &syncservice.ResolveResult{Response: &syncv1.ResolveBaselineResponse{}}, nil
 }
@@ -115,7 +125,7 @@ func testServerWithLogger(t *testing.T, tokens *fakeTokens, oauth *fakeOAuth, re
 			FrontendReturnURL: frontendReturn,
 		},
 		Tokens: tokens, OAuth: oauth, Profiles: &fakeProfiles{}, Sync: &fakeSync{},
-		Realtime: redis, Hub: realtime.NewHub(),
+		Realtime: redis, Hub: realtime.NewHub(), WakeHub: realtime.NewWakeHub(),
 		Logger: logger,
 		Build:  BuildInfo{Version: "test", Commit: "abc", BuildTime: "now"},
 	})

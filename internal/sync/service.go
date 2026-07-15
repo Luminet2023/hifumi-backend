@@ -10,9 +10,13 @@ import (
 	"time"
 
 	syncv1 "github.com/Luminet2023/hifumi-backend/api/sync/v1"
+	"google.golang.org/protobuf/proto"
 )
 
-const maxFutureSkewMs = uint64(5 * time.Minute / time.Millisecond)
+const (
+	maxFutureSkewMs      = uint64(5 * time.Minute / time.Millisecond)
+	maxDiffResponseBytes = 512 * 1024
+)
 
 type CommandMetadata struct {
 	OwnerKey           string
@@ -26,6 +30,28 @@ type ExchangeResult struct {
 	BaselineID    string
 	ServerCursor  uint64
 	ServerVersion uint64
+}
+
+type DiffResult struct {
+	Response      *syncv1.DiffResponse
+	StateChanged  bool
+	DeviceID      string
+	BaselineID    string
+	ServerCursor  uint64
+	ServerVersion uint64
+}
+
+type FeedPage struct {
+	Changes           []*syncv1.Change
+	NextCursor        uint64
+	HasMore           bool
+	BaselineID        string
+	HeadCursor        uint64
+	ServerVersion     uint64
+	ServerUpdatedAtMs uint64
+	ServerProgressDay string
+	BaselineMismatch  bool
+	ResetRequired     bool
 }
 
 type ResolveResult struct {
@@ -102,75 +128,14 @@ func (s *Service) Exchange(
 			return nil
 		}
 
-		acks := make([]*syncv1.MutationAck, 0, len(request.GetMutations()))
-		forcedChanges := make([]*syncv1.Change, 0)
-		archiveChanges := make([]*syncv1.Change, 0)
-		appliedCount := 0
-		for _, mutation := range request.GetMutations() {
-			if err := validateMutation(mutation, request.GetDeviceId()); err != nil {
-				return err
-			}
-			receipt, err := tx.GetReceipt(ctx, mutation.GetOpId())
-			if err == nil {
-				acks = append(acks, receiptAck(receipt))
-				continue
-			}
-			if !errors.Is(err, ErrNotFound) {
-				return err
-			}
-
-			existing, err := tx.GetRecord(ctx, mutation.GetEntityKey())
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				return err
-			}
-			conflict := existing != nil && existing.GetCursor() > mutation.GetBaseVersion()
-			applied := existing == nil || existing.GetCursor() <= mutation.GetBaseVersion()
-			serverCursor := uint64(0)
-			if existing != nil {
-				serverCursor = existing.GetCursor()
-			}
-			if applied {
-				serverCursor, err = tx.NextCursor(ctx)
-				if err != nil {
-					return err
-				}
-				change := mutationChange(mutation, serverCursor, clampClientTime(mutation.GetClientTimeMs(), now))
-				if err := tx.AppendOperation(ctx, change); err != nil {
-					return err
-				}
-				if err := tx.UpsertRecord(ctx, change); err != nil {
-					return err
-				}
-				archiveChanges = append(archiveChanges, change)
-				appliedCount++
-			} else if existing != nil {
-				forcedChanges = append(forcedChanges, existing)
-			}
-			receipt = Receipt{
-				OpID:         mutation.GetOpId(),
-				ServerCursor: serverCursor,
-				Conflict:     conflict,
-				Applied:      applied,
-			}
-			if err := tx.InsertReceipt(ctx, receipt); err != nil {
-				return err
-			}
-			acks = append(acks, receiptAck(receipt))
+		batch, err := applyMutations(ctx, tx, request.GetDeviceId(), request.GetMutations(), now)
+		if err != nil {
+			return err
 		}
 
-		if appliedCount > 0 {
-			records, err := tx.ListRecords(ctx)
-			if err != nil {
-				return err
-			}
-			progressDay, err := deriveProgressDay(records)
-			if err != nil {
-				return err
-			}
-			lineage, err = tx.IncrementLineage(ctx, now, progressDay)
-			if err != nil {
-				return err
-			}
+		lineage, headCursor, err = finalizeMutationBatch(ctx, tx, metadata, lineage, batch, now)
+		if err != nil {
+			return err
 		}
 
 		pullLimit := normalizedPullLimit(request.GetPullLimit())
@@ -188,7 +153,7 @@ func (s *Service) Exchange(
 		for _, change := range pageChanges {
 			seen[changeIdentity(change)] = struct{}{}
 		}
-		for _, change := range forcedChanges {
+		for _, change := range batch.forcedChanges {
 			// 旧实现没有在追加 forced change 后更新 seen；这里有意保持该细节。
 			if _, exists := seen[changeIdentity(change)]; !exists {
 				changes = append(changes, change)
@@ -201,36 +166,10 @@ func (s *Service) Exchange(
 		if len(pageChanges) > 0 {
 			nextCursor = pageChanges[len(pageChanges)-1].GetCursor()
 		}
-		headCursor, err = tx.CurrentCursor(ctx)
-		if err != nil {
-			return err
-		}
-
-		if appliedCount > 0 {
-			for _, change := range archiveChanges {
-				if err := tx.ArchiveChange(ctx, lineage.BaselineID, lineage.Version, now, change); err != nil {
-					return err
-				}
-			}
-			if err := tx.UpsertArchiveHead(ctx, lineage.BaselineID, headCursor, lineage.Version, now); err != nil {
-				return err
-			}
-			if err := tx.InsertRealtimeEvent(ctx, RealtimeEvent{
-				Type:               "sync_hint",
-				BaselineID:         lineage.BaselineID,
-				ServerCursor:       headCursor,
-				ServerVersion:      lineage.Version,
-				OriginConnectionID: metadata.OriginConnectionID,
-				CreatedAtMs:        now,
-			}); err != nil {
-				return err
-			}
-		}
-
 		result = &ExchangeResult{
 			Response: &syncv1.SyncResponse{
 				NextCursor:        nextCursor,
-				Acks:              acks,
+				Acks:              batch.acks,
 				Changes:           changes,
 				HasMore:           hasMore,
 				ResetRequired:     request.GetCursor() > headCursor,
@@ -239,7 +178,7 @@ func (s *Service) Exchange(
 				ServerUpdatedAtMs: lineage.UpdatedAtMs,
 				ServerProgressDay: lineage.ProgressDay,
 			},
-			StateChanged:  appliedCount > 0,
+			StateChanged:  batch.appliedCount > 0,
 			DeviceID:      request.GetDeviceId(),
 			BaselineID:    lineage.BaselineID,
 			ServerCursor:  headCursor,
@@ -248,6 +187,139 @@ func (s *Service) Exchange(
 		return nil
 	})
 	return result, err
+}
+
+func (s *Service) Diff(
+	ctx context.Context,
+	metadata CommandMetadata,
+	request *syncv1.DiffRequest,
+) (*DiffResult, error) {
+	if err := validateDiffRequest(metadata.OwnerKey, request); err != nil {
+		return nil, err
+	}
+	now := uint64(s.now().UnixMilli())
+	var result *DiffResult
+	err := s.store.WithOwnerTransaction(ctx, metadata.OwnerKey, func(tx Tx) error {
+		lineage, err := s.ensureLineage(ctx, tx, request.GetBaselineId(), now)
+		if err != nil {
+			return err
+		}
+		headCursor, err := tx.CurrentCursor(ctx)
+		if err != nil {
+			return err
+		}
+		if lineage.BaselineID != request.GetBaselineId() {
+			response := &syncv1.DiffResponse{
+				BaselineId:        lineage.BaselineID,
+				ServerCursor:      headCursor,
+				ServerVersion:     lineage.Version,
+				ServerUpdatedAtMs: lineage.UpdatedAtMs,
+				ServerProgressDay: lineage.ProgressDay,
+				BaselineMismatch:  true,
+			}
+			if err := validateDiffResponseSize(response); err != nil {
+				return err
+			}
+			result = &DiffResult{
+				Response:      response,
+				DeviceID:      request.GetDeviceId(),
+				BaselineID:    lineage.BaselineID,
+				ServerCursor:  headCursor,
+				ServerVersion: lineage.Version,
+			}
+			return nil
+		}
+
+		batch, err := applyMutations(ctx, tx, request.GetDeviceId(), request.GetMutations(), now)
+		if err != nil {
+			return err
+		}
+		lineage, headCursor, err = finalizeMutationBatch(ctx, tx, metadata, lineage, batch, now)
+		if err != nil {
+			return err
+		}
+		response := &syncv1.DiffResponse{
+			Acks:              batch.acks,
+			CanonicalChanges:  batch.canonicalChanges,
+			BaselineId:        lineage.BaselineID,
+			ServerCursor:      headCursor,
+			ServerVersion:     lineage.Version,
+			ServerUpdatedAtMs: lineage.UpdatedAtMs,
+			ServerProgressDay: lineage.ProgressDay,
+		}
+		// 必须在事务提交前做 deterministic protobuf 上限检查；返回错误会让
+		// WithOwnerTransaction 回滚 mutations、receipts、archive 和 realtime outbox。
+		if err := validateDiffResponseSize(response); err != nil {
+			return err
+		}
+		result = &DiffResult{
+			Response:      response,
+			StateChanged:  batch.appliedCount > 0,
+			DeviceID:      request.GetDeviceId(),
+			BaselineID:    lineage.BaselineID,
+			ServerCursor:  headCursor,
+			ServerVersion: lineage.Version,
+		}
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) ReadFeedPage(
+	ctx context.Context,
+	ownerKey string,
+	baselineID string,
+	cursor uint64,
+	limit int,
+) (*FeedPage, error) {
+	if err := validateOwnerKey(ownerKey); err != nil {
+		return nil, err
+	}
+	if err := validateBaselineID(baselineID, "baseline_id"); err != nil {
+		return nil, err
+	}
+	if err := validateSafe(cursor); err != nil {
+		return nil, err
+	}
+	if limit < 0 {
+		return nil, invalidArgument("invalid feed limit")
+	}
+	feedLimit := normalizedFeedLimit(limit)
+	snapshot, err := s.store.ReadFeedSnapshot(ctx, ownerKey, cursor, feedLimit+1)
+	if errors.Is(err, ErrNotFound) {
+		return &FeedPage{
+			NextCursor:        cursor,
+			BaselineID:        baselineID,
+			ServerProgressDay: campaignStart,
+			ResetRequired:     cursor > 0,
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	page := &FeedPage{
+		NextCursor:        cursor,
+		BaselineID:        snapshot.Lineage.BaselineID,
+		HeadCursor:        snapshot.HeadCursor,
+		ServerVersion:     snapshot.Lineage.Version,
+		ServerUpdatedAtMs: snapshot.Lineage.UpdatedAtMs,
+		ServerProgressDay: snapshot.Lineage.ProgressDay,
+		BaselineMismatch:  snapshot.Lineage.BaselineID != baselineID,
+		ResetRequired:     cursor > snapshot.HeadCursor,
+	}
+	if page.BaselineMismatch || page.ResetRequired {
+		return page, nil
+	}
+	page.HasMore = len(snapshot.Changes) > feedLimit
+	page.Changes = snapshot.Changes
+	if page.HasMore {
+		page.Changes = page.Changes[:feedLimit]
+	}
+	if len(page.Changes) > 0 {
+		page.NextCursor = page.Changes[len(page.Changes)-1].GetCursor()
+	}
+	return page, nil
 }
 
 func (s *Service) ResolveBaseline(
@@ -397,6 +469,161 @@ func (s *Service) ResolveBaseline(
 		return nil
 	})
 	return result, err
+}
+
+type mutationBatch struct {
+	acks             []*syncv1.MutationAck
+	canonicalChanges []*syncv1.Change
+	forcedChanges    []*syncv1.Change
+	archiveChanges   []*syncv1.Change
+	appliedCount     int
+}
+
+func applyMutations(
+	ctx context.Context,
+	tx Tx,
+	deviceID string,
+	mutations []*syncv1.Mutation,
+	now uint64,
+) (mutationBatch, error) {
+	batch := mutationBatch{
+		acks:             make([]*syncv1.MutationAck, 0, len(mutations)),
+		canonicalChanges: make([]*syncv1.Change, 0, len(mutations)),
+		forcedChanges:    make([]*syncv1.Change, 0),
+		archiveChanges:   make([]*syncv1.Change, 0),
+	}
+	for _, mutation := range mutations {
+		if err := validateMutation(mutation, deviceID); err != nil {
+			return mutationBatch{}, err
+		}
+		receipt, err := tx.GetReceipt(ctx, mutation.GetOpId())
+		if err == nil {
+			canonical, err := tx.GetOperation(ctx, receipt.ServerCursor)
+			if err != nil {
+				return mutationBatch{}, err
+			}
+			batch.acks = append(batch.acks, receiptAck(receipt))
+			batch.canonicalChanges = append(batch.canonicalChanges, canonical)
+			continue
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return mutationBatch{}, err
+		}
+
+		existing, err := tx.GetRecord(ctx, mutation.GetEntityKey())
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return mutationBatch{}, err
+		}
+		conflict := existing != nil && existing.GetCursor() > mutation.GetBaseVersion()
+		applied := existing == nil || existing.GetCursor() <= mutation.GetBaseVersion()
+		serverCursor := uint64(0)
+		if existing != nil {
+			serverCursor = existing.GetCursor()
+		}
+		var canonical *syncv1.Change
+		if applied {
+			serverCursor, err = tx.NextCursor(ctx)
+			if err != nil {
+				return mutationBatch{}, err
+			}
+			canonical = mutationChange(mutation, serverCursor, clampClientTime(mutation.GetClientTimeMs(), now))
+			if err := tx.AppendOperation(ctx, canonical); err != nil {
+				return mutationBatch{}, err
+			}
+			if err := tx.UpsertRecord(ctx, canonical); err != nil {
+				return mutationBatch{}, err
+			}
+			batch.archiveChanges = append(batch.archiveChanges, canonical)
+			batch.appliedCount++
+		} else {
+			canonical = existing
+			batch.forcedChanges = append(batch.forcedChanges, existing)
+		}
+		receipt = Receipt{
+			OpID:         mutation.GetOpId(),
+			ServerCursor: serverCursor,
+			Conflict:     conflict,
+			Applied:      applied,
+		}
+		if err := tx.InsertReceipt(ctx, receipt); err != nil {
+			return mutationBatch{}, err
+		}
+		batch.acks = append(batch.acks, receiptAck(receipt))
+		batch.canonicalChanges = append(batch.canonicalChanges, canonical)
+	}
+	return batch, nil
+}
+
+func finalizeMutationBatch(
+	ctx context.Context,
+	tx Tx,
+	metadata CommandMetadata,
+	lineage Lineage,
+	batch mutationBatch,
+	now uint64,
+) (Lineage, uint64, error) {
+	var err error
+	if batch.appliedCount > 0 {
+		records, err := tx.ListRecords(ctx)
+		if err != nil {
+			return Lineage{}, 0, err
+		}
+		progressDay, err := deriveProgressDay(records)
+		if err != nil {
+			return Lineage{}, 0, err
+		}
+		lineage, err = tx.IncrementLineage(ctx, now, progressDay)
+		if err != nil {
+			return Lineage{}, 0, err
+		}
+	}
+	headCursor, err := tx.CurrentCursor(ctx)
+	if err != nil {
+		return Lineage{}, 0, err
+	}
+	if batch.appliedCount == 0 {
+		return lineage, headCursor, nil
+	}
+	for _, change := range batch.archiveChanges {
+		if err := tx.ArchiveChange(ctx, lineage.BaselineID, lineage.Version, now, change); err != nil {
+			return Lineage{}, 0, err
+		}
+	}
+	if err := tx.UpsertArchiveHead(ctx, lineage.BaselineID, headCursor, lineage.Version, now); err != nil {
+		return Lineage{}, 0, err
+	}
+	if err := tx.InsertRealtimeEvent(ctx, RealtimeEvent{
+		Type:               "sync_hint",
+		BaselineID:         lineage.BaselineID,
+		ServerCursor:       headCursor,
+		ServerVersion:      lineage.Version,
+		OriginConnectionID: metadata.OriginConnectionID,
+		CreatedAtMs:        now,
+	}); err != nil {
+		return Lineage{}, 0, err
+	}
+	return lineage, headCursor, nil
+}
+
+func validateDiffResponseSize(response *syncv1.DiffResponse) error {
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > maxDiffResponseBytes {
+		return ErrResponseTooLarge
+	}
+	return nil
+}
+
+func normalizedFeedLimit(value int) int {
+	if value == 0 {
+		return int(defaultPullLimit)
+	}
+	if value > int(maxPullLimit) {
+		return int(maxPullLimit)
+	}
+	return value
 }
 
 func (s *Service) ensureLineage(ctx context.Context, tx Tx, requestedBaselineID string, now uint64) (Lineage, error) {
