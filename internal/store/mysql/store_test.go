@@ -12,6 +12,16 @@ import (
 
 const ownerKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestNonNullBlobNormalizesNil(t *testing.T) {
+	if value := nonNullBlob(nil); value == nil || len(value) != 0 {
+		t.Fatalf("nil value was not normalized to an empty blob: %#v", value)
+	}
+	original := []byte(`{"done":true}`)
+	if value := nonNullBlob(original); string(value) != string(original) {
+		t.Fatalf("non-empty value changed: got %q want %q", value, original)
+	}
+}
+
 func TestWithOwnerTransactionLocksOwnerForUpdate(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

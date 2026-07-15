@@ -243,6 +243,77 @@ func TestMySQLConcurrentDiffFeedReplayConflictAndBaselineArchive(t *testing.T) {
 	}
 }
 
+func TestMySQLDiffStoresDeletedMutationAsEmptyBlob(t *testing.T) {
+	db := integrationDB(t)
+	store := mysqlstore.New(db)
+	service := syncservice.NewService(store)
+	owner := auth.OwnerKey(fmt.Sprintf("delete-integration-%d", time.Now().UnixNano()))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	deleted := mutation(
+		"operation_delete_0001",
+		"stella/v1/day/2026-07-16/item/deleted",
+		"",
+	)
+	deleted.ValueJson = nil
+	deleted.Deleted = true
+
+	result, err := service.Diff(ctx, syncservice.CommandMetadata{OwnerKey: owner}, diffRequest(
+		baselineA,
+		[]*syncv1.Mutation{deleted},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Response.GetAcks()) != 1 || !result.Response.GetAcks()[0].GetApplied() {
+		t.Fatalf("delete mutation was not applied: %+v", result.Response)
+	}
+	assertStoredDelete := func(table, baselineID string) {
+		t.Helper()
+		var isNull, storedDeleted bool
+		var valueLength int
+		query := "SELECT value_json IS NULL, OCTET_LENGTH(value_json), deleted FROM " + table + " WHERE owner_key = ? AND op_id = ?"
+		args := []any{owner, deleted.GetOpId()}
+		if baselineID != "" {
+			query += " AND baseline_id = ?"
+			args = append(args, baselineID)
+		}
+		if err := db.QueryRowContext(ctx, query, args...).Scan(&isNull, &valueLength, &storedDeleted); err != nil {
+			t.Fatalf("query %s: %v", table, err)
+		}
+		if isNull || valueLength != 0 || !storedDeleted {
+			t.Fatalf("%s stored delete as null=%v length=%d deleted=%v", table, isNull, valueLength, storedDeleted)
+		}
+	}
+	assertStoredDelete("sync_records", "")
+	assertStoredDelete("sync_operations", "")
+
+	replay, err := service.Diff(ctx, syncservice.CommandMetadata{OwnerKey: owner}, diffRequest(
+		baselineA,
+		[]*syncv1.Mutation{deleted},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.StateChanged || replay.ServerCursor != result.ServerCursor || replay.ServerVersion != result.ServerVersion {
+		t.Fatalf("delete replay changed state: first=%+v replay=%+v", result, replay)
+	}
+
+	resolved, err := service.ResolveBaseline(ctx, syncservice.CommandMetadata{OwnerKey: owner}, &syncv1.ResolveBaselineRequest{
+		RequestId:                "resolve_delete_0001",
+		DeviceId:                 "device_alpha",
+		LocalBaselineId:          baselineB,
+		ExpectedServerBaselineId: baselineA,
+		ExpectedServerVersion:    result.ServerVersion,
+		Choice:                   syncv1.BaselineChoice_BASELINE_CHOICE_USE_LOCAL,
+		LocalProgressDay:         "2026-07-13",
+	})
+	if err != nil || resolved.Response.GetStale() {
+		t.Fatalf("archive deleted mutation: result=%+v err=%v", resolved, err)
+	}
+	assertStoredDelete("sync_archive_changes", baselineA)
+}
+
 func TestRedisSharedLimitsLeasesPubSubHandoffAndOutbox(t *testing.T) {
 	redisURL := os.Getenv("REDIS_TEST_URL")
 	if redisURL == "" {

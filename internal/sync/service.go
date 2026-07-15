@@ -661,10 +661,12 @@ func (s *Service) ensureLineage(ctx context.Context, tx Tx, requestedBaselineID 
 }
 
 func mutationChange(mutation *syncv1.Mutation, cursor, clientTimeMs uint64) *syncv1.Change {
+	valueJSON := make([]byte, len(mutation.GetValueJson()))
+	copy(valueJSON, mutation.GetValueJson())
 	return &syncv1.Change{
 		Cursor:       cursor,
 		EntityKey:    mutation.GetEntityKey(),
-		ValueJson:    append([]byte(nil), mutation.GetValueJson()...),
+		ValueJson:    valueJSON,
 		Deleted:      mutation.GetDeleted(),
 		DeviceId:     mutation.GetDeviceId(),
 		ClientTimeMs: clientTimeMs,

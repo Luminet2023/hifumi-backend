@@ -296,7 +296,7 @@ func (t *ownerTx) AppendOperation(ctx context.Context, change *syncv1.Change) er
 		change.GetCursor(),
 		change.GetOpId(),
 		change.GetEntityKey(),
-		change.GetValueJson(),
+		nonNullBlob(change.GetValueJson()),
 		change.GetDeleted(),
 		change.GetDeviceId(),
 		change.GetClientTimeMs(),
@@ -315,7 +315,7 @@ func (t *ownerTx) UpsertRecord(ctx context.Context, change *syncv1.Change) error
 		t.ownerKey,
 		change.GetEntityKey(),
 		change.GetCursor(),
-		change.GetValueJson(),
+		nonNullBlob(change.GetValueJson()),
 		change.GetDeleted(),
 		change.GetDeviceId(),
 		change.GetClientTimeMs(),
@@ -448,7 +448,7 @@ func (t *ownerTx) ArchiveChange(
 		change.GetCursor(),
 		change.GetOpId(),
 		change.GetEntityKey(),
-		change.GetValueJson(),
+		nonNullBlob(change.GetValueJson()),
 		change.GetDeleted(),
 		change.GetDeviceId(),
 		change.GetClientTimeMs(),
@@ -456,6 +456,13 @@ func (t *ownerTx) ArchiveChange(
 		archivedAtMs,
 	)
 	return err
+}
+
+func nonNullBlob(value []byte) []byte {
+	if value == nil {
+		return []byte{}
+	}
+	return value
 }
 
 func (t *ownerTx) UpsertArchiveHead(

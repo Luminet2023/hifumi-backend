@@ -102,6 +102,35 @@ func TestDiffCanonicalChangesAppliedReplayConflictAndMismatch(t *testing.T) {
 	}
 }
 
+func TestDiffDeletedMutationKeepsNonNullEmptyValue(t *testing.T) {
+	store := newMemoryStore()
+	service := newTestService(store)
+	mutation := testMutation(
+		"operation_delete_0001",
+		"stella/v1/day/2026-07-16/item/deleted",
+		"device_alpha",
+		0,
+		"",
+	)
+	mutation.ValueJson = nil
+	mutation.Deleted = true
+
+	result, err := service.Diff(context.Background(), CommandMetadata{OwnerKey: testOwner}, &syncv1.DiffRequest{
+		DeviceId: "device_alpha", BaselineId: testBaselineA, Mutations: []*syncv1.Mutation{mutation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := result.Response.GetCanonicalChanges()
+	if len(canonical) != 1 || !canonical[0].GetDeleted() || canonical[0].ValueJson == nil || len(canonical[0].GetValueJson()) != 0 {
+		t.Fatalf("deleted canonical value was not a non-null empty byte slice: %+v", canonical)
+	}
+	stored := store.owners[testOwner].records[mutation.GetEntityKey()]
+	if stored == nil || !stored.GetDeleted() || len(stored.GetValueJson()) != 0 {
+		t.Fatalf("deleted record did not preserve its empty-value semantics: %+v", stored)
+	}
+}
+
 func TestDiffResponseTooLargeRollsBackTransaction(t *testing.T) {
 	store := newMemoryStore()
 	service := newTestService(store)
